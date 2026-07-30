@@ -963,25 +963,26 @@ impl BackendStorage for MetalStorage {
         let n = params.c_out;
         let k = params.k_size * params.c_in;
         let m = l_out;
-        let col_l = Layout::contiguous((b, m, k));
-        let res = if kernel_l.is_contiguous() {
+        // Produce the result already oriented as (b, c_out, l_out) rather than computing
+        // (b, l_out, c_out) and transposing it afterwards with a full strided copy. The GEMM
+        // accepts a transposed operand through its stride flags, so `kernel @ col^T` costs the
+        // same as `col @ kernel` while landing in the layout the caller wants. The transpose this
+        // replaces ran at ~20 GB/s (transposes coalesce badly) and measured 4x the cost of the
+        // matmul itself on a 221 MB tensor.
+        let col_l = Layout::contiguous((b, m, k)).transpose(1, 2)?;
+        if kernel_l.is_contiguous() {
             let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
-                .transpose(1, 2)?
-                .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+                .broadcast_as((b, n, k))?;
+            kernel.matmul(&col, (b, n, m, k), &kernel_l, &col_l)
         } else {
-            // Make the kernel contiguous if not already the case.
+            // Make the kernel contiguous if not already the case. The COPY has to be the operand:
+            // describing the original strided buffer with a contiguous layout reads the wrong
+            // elements, which is what the previous version of this branch did.
             let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
-                .transpose(1, 2)?
-                .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
-        };
-        let res_l = Layout::contiguous((b, l_out, n)).transpose(1, 2)?;
-        let mut res_t = self.device().zeros_impl(res_l.shape(), res.dtype())?;
-        res.copy_strided_src(&mut res_t, 0, &res_l)?;
-        Ok(res_t)
+            let kernel_l = Layout::contiguous((1, n, k)).broadcast_as((b, n, k))?;
+            kernel_c.matmul(&col, (b, n, m, k), &kernel_l, &col_l)
+        }
     }
 
     fn conv_transpose1d(
@@ -1166,27 +1167,24 @@ impl BackendStorage for MetalStorage {
         let n = params.c_out;
         let k = params.k_h * params.k_w * params.c_in;
         let m = h_out * w_out;
-        let col_l = Layout::contiguous((b, m, k));
-        let res = if kernel_l.is_contiguous() {
+        // As in `conv1d`: compute the result already oriented as (b, c_out, h_out, w_out) instead
+        // of producing (b, h_out, w_out, c_out) and permuting it afterwards with a full strided
+        // copy. `(b, n, m)` contiguous IS `(b, c_out, h_out, w_out)` once m = h_out * w_out, so the
+        // copy simply disappears.
+        let col_l = Layout::contiguous((b, m, k)).transpose(1, 2)?;
+        if kernel_l.is_contiguous() {
             let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
-                .transpose(1, 2)?
-                .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
+                .broadcast_as((b, n, k))?;
+            kernel.matmul(&col, (b, n, m, k), &kernel_l, &col_l)
         } else {
-            // Make the kernel contiguous if not already the case.
+            // Make the kernel contiguous if not already the case. The COPY has to be the operand:
+            // describing the original strided buffer with a contiguous layout reads the wrong
+            // elements, which is what the previous version of this branch did.
             let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
-            let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
-                .transpose(1, 2)?
-                .broadcast_as((b, k, n))?;
-            col.matmul(kernel, (b, m, n, k), &col_l, &kernel_l)?
-        };
-        let res_l = Layout::contiguous((b, h_out, w_out, n))
-            .transpose(1, 2)?
-            .transpose(1, 3)?;
-        let mut res_t = self.device().zeros_impl(res_l.shape(), res.dtype())?;
-        res.copy_strided_src(&mut res_t, 0, &res_l)?;
-        Ok(res_t)
+            let kernel_l = Layout::contiguous((1, n, k)).broadcast_as((b, n, k))?;
+            kernel_c.matmul(&col, (b, n, m, k), &kernel_l, &col_l)
+        }
     }
 
     fn conv_transpose2d(
