@@ -25,11 +25,19 @@ METAL_FUNC uint get_strided_index(
     constant size_t *dims,
     constant size_t *strides
 ) {
+    // `dims` and `strides` are `size_t`, so `idx % dims[d]` promotes the whole expression to 64
+    // bits and costs a software-emulated 64-bit division AND modulo per dimension, per element.
+    // Narrowing to `uint` first is safe for the same reason the index itself is a `uint`: the
+    // tensor has at most 2^32 elements. See the longer note in binary.metal -- six files carry
+    // a private copy of this function and `utils.metal`'s narrowed version reaches none of them.
+    const uint nd = uint(num_dims);
     uint strided_i = 0;
-    for (uint d = 0; d < num_dims; d++) {
-        uint dim_idx = num_dims - 1 - d;
-        strided_i += (idx % dims[dim_idx]) * strides[dim_idx];
-        idx /= dims[dim_idx];
+    for (uint d = 0; d < nd; d++) {
+        uint dim_idx = nd - 1 - d;
+        uint dim = uint(dims[dim_idx]);
+        uint next = idx / dim;
+        strided_i += (idx - next * dim) * uint(strides[dim_idx]);
+        idx = next;
     }
     return strided_i;
 }

@@ -382,6 +382,69 @@ fn ternary_op(device: &Device) -> Result<()> {
     Ok(())
 }
 
+// The three tests below cover *strided* (non-contiguous) operands. Backends generally have two
+// code paths per op -- a contiguous one that indexes the buffer directly and a strided one that
+// decodes a logical index into an offset -- and the tests above only ever pass contiguous
+// tensors, so the strided decode of `where_cond`, `to_dtype` and `index_select` was reachable
+// from safe Rust but exercised by nothing. Each test was verified to FAIL when the strided index
+// arithmetic of the corresponding kernel is perturbed.
+//
+// They use rank-3, non-square shapes on purpose: the decode loops over dimensions, so a rank-2
+// or square case can pass with the loop bounds or the dimension order wrong.
+
+fn strided_ternary_op(device: &Device) -> Result<()> {
+    // (2, 3, 4) -> (2, 4, 3), non-contiguous in all three operands.
+    let t = Tensor::arange(0f32, 24f32, device)?.reshape((2, 3, 4))?;
+    let a = t.transpose(1, 2)?;
+    let b = (&t + 100.0)?.transpose(1, 2)?;
+    let cond = Tensor::new(
+        &[
+            [[1u8, 0, 1, 0], [0, 1, 0, 1], [1, 1, 0, 0]],
+            [[0, 0, 1, 1], [1, 0, 1, 0], [0, 1, 1, 0]],
+        ],
+        device,
+    )?
+    .transpose(1, 2)?;
+    let tensor = cond.where_cond(&a, &b)?;
+    assert_eq!(tensor.dims(), [2, 4, 3]);
+    // Picked elementwise from `a` where cond is 1 and from `b` (= a + 100) where it is 0, with
+    // every operand read through a transposed layout.
+    assert_eq!(
+        tensor.to_vec3::<f32>()?,
+        &[
+            [
+                [0., 104., 8.],
+                [101., 5., 9.],
+                [2., 106., 110.],
+                [103., 7., 111.]
+            ],
+            [
+                [112., 16., 120.],
+                [113., 117., 21.],
+                [14., 18., 22.],
+                [15., 119., 123.]
+            ]
+        ]
+    );
+    Ok(())
+}
+
+fn strided_cast(device: &Device) -> Result<()> {
+    // A cast reads through the source layout, so a transposed source exercises the strided path.
+    let t = Tensor::arange(0f32, 24f32, device)?.reshape((2, 3, 4))?;
+    let tt = t.transpose(1, 2)?;
+    assert_eq!(tt.dims(), [2, 4, 3]);
+    let expected = &[
+        [[0u32, 4, 8], [1, 5, 9], [2, 6, 10], [3, 7, 11]],
+        [[12, 16, 20], [13, 17, 21], [14, 18, 22], [15, 19, 23]],
+    ];
+    assert_eq!(tt.to_dtype(DType::U32)?.to_vec3::<u32>()?, expected);
+    // A contiguous read of the same buffer would give 0,1,2 / 3,4,5 ... so this distinguishes
+    // "decoded the strides" from "ignored them".
+    assert_eq!(t.to_dtype(DType::U32)?.flatten_all()?.to_vec1::<u32>()?[..3], [0, 1, 2]);
+    Ok(())
+}
+
 fn transpose(device: &Device) -> Result<()> {
     let data = &[[3f32, 1., 4., 1., 5.], [2., 1., 7., 8., 2.]];
     let tensor = Tensor::new(data, device)?.t()?;
@@ -1735,6 +1798,18 @@ test_device!(transpose, transpose_cpu, transpose_gpu, transpose_metal);
 test_device!(unary_op, unary_op_cpu, unary_op_gpu, unary_op_metal);
 test_device!(binary_op, binary_op_cpu, binary_op_gpu, binary_op_metal);
 test_device!(ternary_op, ternary_op_cpu, ternary_op_gpu, ternary_op_metal);
+test_device!(
+    strided_ternary_op,
+    strided_ternary_op_cpu,
+    strided_ternary_op_gpu,
+    strided_ternary_op_metal
+);
+test_device!(
+    strided_cast,
+    strided_cast_cpu,
+    strided_cast_gpu,
+    strided_cast_metal
+);
 test_device!(embeddings, embeddings_cpu, embeddings_gpu, embeddings_metal);
 test_device!(cmp, cmp_cpu, cmp_gpu, cmp_metal);
 test_device!(
