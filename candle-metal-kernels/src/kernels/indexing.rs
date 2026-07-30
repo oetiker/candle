@@ -43,6 +43,9 @@ pub fn call_index_select(
             right_size,
             ids_size,
             contiguous,
+            // The RANK of the source. The kernel used to reuse `src_dim_size` for this and read
+            // past the end of `src_dims`/`src_strides` on the non-contiguous path.
+            src_dims.len(),
             src_dims,
             src_strides,
             &input,

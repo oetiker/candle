@@ -445,6 +445,39 @@ fn strided_cast(device: &Device) -> Result<()> {
     Ok(())
 }
 
+/// `index_select` from a NON-contiguous source, which only the Metal backend supports: the CPU
+/// and CUDA backends reject it with `RequiresContiguous`, so this cannot be a `test_device!`.
+/// Metal instead forwards `src_l.is_contiguous()` to the kernel and takes a strided branch that
+/// nothing else exercises.
+///
+/// The strided result must equal the contiguous one; that equivalence is the whole contract, so
+/// the test asserts it directly as well as against hand-computed values.
+#[cfg(feature = "metal")]
+#[test]
+fn strided_index_select_metal() -> Result<()> {
+    let device = Device::new_metal(0)?;
+    let t = Tensor::arange(0f32, 24f32, &device)?.reshape((2, 3, 4))?;
+    let tt = t.transpose(1, 2)?;
+    assert_eq!(tt.dims(), [2, 4, 3]);
+    assert!(!tt.is_contiguous());
+    for dtype in [DType::U8, DType::U32, DType::I64] {
+        let ids = Tensor::new(&[3u32, 0, 2], &device)?.to_dtype(dtype)?;
+        let strided = tt.index_select(&ids, 1)?;
+        assert_eq!(strided.dims(), [2, 3, 3]);
+        // Same selection with the source materialised first: the reference.
+        let contiguous = tt.contiguous()?.index_select(&ids, 1)?;
+        assert_eq!(strided.to_vec3::<f32>()?, contiguous.to_vec3::<f32>()?);
+        assert_eq!(
+            strided.to_vec3::<f32>()?,
+            &[
+                [[3., 7., 11.], [0., 4., 8.], [2., 6., 10.]],
+                [[15., 19., 23.], [12., 16., 20.], [14., 18., 22.]]
+            ]
+        );
+    }
+    Ok(())
+}
+
 fn transpose(device: &Device) -> Result<()> {
     let data = &[[3f32, 1., 4., 1., 5.], [2., 1., 7., 8., 2.]];
     let tensor = Tensor::new(data, device)?.t()?;
