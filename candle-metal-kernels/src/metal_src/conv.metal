@@ -25,29 +25,33 @@ METAL_FUNC void im2col(
   if (tid >= dst_numel) {
     return;
   }
-  const size_t b_in = src_dims[0];
-  const size_t c_in = src_dims[1];
+  // The whole destination decode is done in 32 bits. `tid` is a `uint`, so no destination index or
+  // stride can exceed it, and 64-bit integer division is emulated in software on this GPU: five of
+  // them per output element made im2col ALU-bound at ~7 GB/s, while a plain elementwise pass over
+  // the same tensor sustains ~100 GB/s. Only the source index, which is scaled by caller-supplied
+  // strides, stays 64-bit. Measured on ReDimNet-b6: the grouped 3x3 convolution of stage 0 drops
+  // from 270 ms to 63 ms, and a full forward from 13.90 s to 9.38 s.
+  const uint c_in = uint(src_dims[1]);
   const size_t h_in = src_dims[2];
   const size_t w_in = src_dims[3];
 
-  const size_t dst_s4 = w_k;
-  const size_t dst_s3 = h_k * dst_s4;
-  const size_t dst_s2 = c_in * dst_s3;
-  const size_t dst_s1 = w_out * dst_s2;
-  const size_t dst_s0 = h_out * dst_s1;
+  const uint dst_s4 = uint(w_k);
+  const uint dst_s3 = uint(h_k) * dst_s4;
+  const uint dst_s2 = c_in * dst_s3;
+  const uint dst_s1 = uint(w_out) * dst_s2;
+  const uint dst_s0 = uint(h_out) * dst_s1;
 
-  size_t tmp_tid = tid;
-  const size_t b_idx = tmp_tid / dst_s0;
+  uint tmp_tid = tid;
+  const uint b_idx = tmp_tid / dst_s0;
   tmp_tid -= b_idx * dst_s0;
-  const size_t h_idx = tmp_tid / dst_s1;
+  const uint h_idx = tmp_tid / dst_s1;
   tmp_tid -= h_idx * dst_s1;
-  const size_t w_idx = tmp_tid / dst_s2;
+  const uint w_idx = tmp_tid / dst_s2;
   tmp_tid -= w_idx * dst_s2;
-  const size_t c_idx = tmp_tid / dst_s3;
+  const uint c_idx = tmp_tid / dst_s3;
   tmp_tid -= c_idx * dst_s3;
-  const size_t h_k_idx = tmp_tid / dst_s4;
-  tmp_tid -= h_k_idx * dst_s4;
-  const size_t w_k_idx = tmp_tid;
+  const uint h_k_idx = tmp_tid / dst_s4;
+  const uint w_k_idx = tmp_tid - h_k_idx * dst_s4;
   size_t src_h_idx = h_idx * stride + h_k_idx * dilation;
   size_t src_w_idx = w_idx * stride + w_k_idx * dilation;
   if (src_h_idx < padding || src_h_idx >= h_in + padding) {
@@ -131,22 +135,22 @@ METAL_FUNC void im2col1d(
   if (tid >= dst_numel) {
     return;
   }
-  const size_t b_in = src_dims[0];
-  const size_t c_in = src_dims[1];
+  // 32-bit destination decode, for the reason spelled out in `im2col` above: `tid` is a `uint`, so
+  // the indices cannot overflow it, and 64-bit integer division is emulated in software here.
+  const uint c_in = uint(src_dims[1]);
   const size_t l_in = src_dims[2];
 
-  const size_t dst_s2 = l_k;
-  const size_t dst_s1 = c_in * dst_s2;
-  const size_t dst_s0 = l_out * dst_s1;
+  const uint dst_s2 = uint(l_k);
+  const uint dst_s1 = c_in * dst_s2;
+  const uint dst_s0 = uint(l_out) * dst_s1;
 
-  size_t tmp_dst_i = tid;
-  const size_t b_idx = tmp_dst_i / dst_s0;
+  uint tmp_dst_i = tid;
+  const uint b_idx = tmp_dst_i / dst_s0;
   tmp_dst_i -= b_idx * dst_s0;
-  const size_t l_idx = tmp_dst_i / dst_s1;
+  const uint l_idx = tmp_dst_i / dst_s1;
   tmp_dst_i -= l_idx * dst_s1;
-  const size_t c_idx = tmp_dst_i / dst_s2;
-  tmp_dst_i -= c_idx * dst_s2;
-  const size_t l_k_idx = tmp_dst_i;
+  const uint c_idx = tmp_dst_i / dst_s2;
+  const uint l_k_idx = tmp_dst_i - c_idx * dst_s2;
   size_t src_l_idx = l_idx * stride + l_k_idx * dilation;
   if (src_l_idx < padding || src_l_idx >= l_in + padding) {
     dst[tid] = static_cast<T>(0);

@@ -970,3 +970,170 @@ test_device!(
     conv2d_c_eq_h_eq_w_gpu,
     conv2d_c_eq_h_eq_w_metal
 );
+
+/// Deterministic, device-independent test data. A tiny LCG rather than `rand_uniform` so that the
+/// reference and the tested path see byte-identical inputs on every backend.
+fn lcg_vec(len: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed;
+    (0..len)
+        .map(|_| {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        })
+        .collect()
+}
+
+/// Grouped `conv2d` against the same convolution done one group at a time.
+///
+/// Backends may fuse all groups into a single im2col plus one batched matmul; the per-group form
+/// below is the definition that fusion has to reproduce. It also covers the `k == 1` shortcut,
+/// where the columns are the input itself, and a non-contiguous input, where that shortcut must
+/// NOT be taken.
+fn conv2d_grouped(dev: &Device) -> Result<()> {
+    // (b, groups, c_in per group, c_out per group, h, w, k_h, k_w, padding, stride, dilation)
+    let cases = [
+        (1, 3, 2, 4, 5, 6, 3, 3, 1, 1, 1),
+        (2, 3, 2, 4, 5, 6, 3, 3, 1, 1, 1),
+        (2, 4, 1, 1, 7, 7, 3, 3, 0, 2, 1),
+        (3, 2, 3, 5, 6, 6, 1, 1, 0, 1, 1),
+        (2, 2, 2, 2, 6, 6, 3, 3, 2, 1, 2),
+        (2, 5, 2, 3, 4, 9, 2, 2, 1, 1, 1),
+        (4, 8, 4, 4, 5, 5, 1, 1, 0, 1, 1),
+    ];
+    for (i, &(b, groups, c_in_g, c_out_g, h, w, k_h, k_w, padding, stride, dilation)) in
+        cases.iter().enumerate()
+    {
+        let c_in = c_in_g * groups;
+        let c_out = c_out_g * groups;
+        let t = Tensor::from_vec(lcg_vec(b * c_in * h * w, 17 + i as u64), (b, c_in, h, w), dev)?;
+        let wt = Tensor::from_vec(
+            lcg_vec(c_out * c_in_g * k_h * k_w, 991 + i as u64),
+            (c_out, c_in_g, k_h, k_w),
+            dev,
+        )?;
+
+        let res = t.conv2d(&wt, padding, stride, dilation, groups)?;
+
+        let per_group = (0..groups)
+            .map(|g| {
+                let ti = t.narrow(1, g * c_in_g, c_in_g)?;
+                let wi = wt.narrow(0, g * c_out_g, c_out_g)?;
+                ti.conv2d(&wi, padding, stride, dilation, 1)
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let expected = Tensor::cat(&per_group, 1)?;
+
+        assert_eq!(res.dims(), expected.dims(), "case {i}: shape");
+        let diff = (res - expected)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(diff < 1e-5, "case {i}: grouped conv2d differs by {diff}");
+    }
+
+    // A non-contiguous 1x1 input: the "columns are the input" shortcut is only valid on a
+    // contiguous layout, so this checks the guard rather than the shortcut.
+    let t = Tensor::from_vec(lcg_vec(2 * 6 * 5 * 8, 4242), (2, 6, 5, 8), dev)?;
+    let t = t.narrow(3, 1, 4)?;
+    let wt = Tensor::from_vec(lcg_vec(9 * 2, 77), (9, 2, 1, 1), dev)?;
+    let res = t.conv2d(&wt, 0, 1, 1, 3)?;
+    let per_group = (0..3)
+        .map(|g| {
+            let ti = t.narrow(1, g * 2, 2)?;
+            let wi = wt.narrow(0, g * 3, 3)?;
+            ti.conv2d(&wi, 0, 1, 1, 1)
+        })
+        .collect::<candle_core::Result<Vec<_>>>()?;
+    let expected = Tensor::cat(&per_group, 1)?;
+    let diff = (res - expected)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-5, "non-contiguous grouped conv2d differs by {diff}");
+
+    Ok(())
+}
+
+/// Convolutions whose kernel is a single tap, where im2col is the identity and the backend may
+/// skip it. The reference is a plain matmul, which is what such a convolution *is* — a formulation
+/// that shares no code with either convolution path.
+///
+/// The cases with a stride, a padding, a dilation or a non-contiguous input are the guards: there
+/// the shortcut must NOT be taken, and taking it would read the wrong elements.
+fn conv_pointwise(dev: &Device) -> Result<()> {
+    let (b, c_in, c_out, l) = (2usize, 6usize, 4usize, 11usize);
+    let x = Tensor::from_vec(lcg_vec(b * c_in * l, 5), (b, c_in, l), dev)?;
+    let w = Tensor::from_vec(lcg_vec(c_out * c_in, 6), (c_out, c_in, 1), dev)?;
+
+    let expect_matmul = |x: &Tensor, w: &Tensor, len: usize| -> Result<Tensor> {
+        let bs = x.dim(0)?;
+        let w2 = w.reshape((c_out, c_in))?.unsqueeze(0)?.broadcast_as((bs, c_out, c_in))?;
+        Ok(w2.contiguous()?.matmul(&x.contiguous()?.reshape((bs, c_in, len))?)?)
+    };
+
+    let res = x.conv1d(&w, 0, 1, 1, 1)?;
+    let diff = (&res - expect_matmul(&x, &w, l)?)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-5, "contiguous pointwise conv1d differs by {diff}");
+
+    // Non-contiguous input: the shortcut must be declined and im2col used instead.
+    let xn = x.narrow(2, 2, 6)?;
+    let res = xn.conv1d(&w, 0, 1, 1, 1)?;
+    let diff = (&res - expect_matmul(&xn, &w, 6)?)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-5, "non-contiguous pointwise conv1d differs by {diff}");
+
+    // Stride 2 with a single tap samples every other position; the shortcut does not apply.
+    let res = x.conv1d(&w, 0, 2, 1, 1)?;
+    let strided_ref = expect_matmul(&x, &w, l)?;
+    let expected = Tensor::cat(
+        &(0..l).step_by(2).map(|i| strided_ref.narrow(2, i, 1)).collect::<candle_core::Result<Vec<_>>>()?,
+        2,
+    )?;
+    let diff = (&res - expected)?
+        .abs()?
+        .flatten_all()?
+        .max(0)?
+        .to_scalar::<f32>()?;
+    assert!(diff < 1e-5, "strided pointwise conv1d differs by {diff}");
+
+    // The 2D form, contiguous and not.
+    let (h, wd) = (5usize, 7usize);
+    let x2 = Tensor::from_vec(lcg_vec(b * c_in * h * wd, 7), (b, c_in, h, wd), dev)?;
+    let w2 = Tensor::from_vec(lcg_vec(c_out * c_in, 8), (c_out, c_in, 1, 1), dev)?;
+    for (label, xt) in [("contiguous", x2.clone()), ("narrowed", x2.narrow(3, 1, 4)?)] {
+        let res = xt.conv2d(&w2, 0, 1, 1, 1)?;
+        let (_, _, hh, ww) = xt.dims4()?;
+        let expected = expect_matmul(&xt, &w2, hh * ww)?.reshape((b, c_out, hh, ww))?;
+        let diff = (&res - expected)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(diff < 1e-5, "{label} pointwise conv2d differs by {diff}");
+    }
+
+    Ok(())
+}
+
+test_device!(
+    conv_pointwise,
+    conv_pointwise_cpu,
+    conv_pointwise_gpu,
+    conv_pointwise_metal
+);
+
+test_device!(
+    conv2d_grouped,
+    conv2d_grouped_cpu,
+    conv2d_grouped_gpu,
+    conv2d_grouped_metal
+);

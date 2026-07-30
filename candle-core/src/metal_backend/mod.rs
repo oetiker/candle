@@ -913,67 +913,77 @@ impl BackendStorage for MetalStorage {
         params: &ParamsConv1D,
     ) -> Result<Self> {
         let device = self.device().clone();
-        let shape = layout.shape();
-        let dims = shape.dims();
-        let strides = layout.stride();
-
-        let stride = params.stride;
-        let dilation = params.dilation;
-        let padding = params.padding;
-        let k_size = params.k_size;
-        let l_out = (dims[2] + 2 * padding - dilation * (k_size - 1) - 1) / stride + 1;
-        let dst_el = dims[0] * l_out * dims[1] * k_size;
-        let dst = self
-            .device
-            .new_buffer_builder()
-            .with_size_for(dst_el, self.dtype)
-            .with_label("conv1d_im2col")
-            .build()?;
-        let encoder = self.device.command_encoder()?;
-        let name = match self.dtype {
-            DType::F32 => "im2col1d_f32",
-            DType::F16 => "im2col1d_f16",
-            DType::BF16 => "im2col1d_bf16",
-            DType::U8 => "im2col1d_u8",
-            DType::U32 => "im2col1d_u32",
-            dtype => crate::bail!("Metal conv1d {dtype:?} not implemented"),
-        };
-        let src = buffer_o(&self.buffer, layout, self.dtype);
-        candle_metal_kernels::call_im2col1d_strided(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            layout.shape().dims(),
-            strides,
-            (k_size, stride, padding, dilation),
-            src,
-            &dst,
-        )
-        .map_err(MetalError::from)?;
-        drop(encoder);
-        let col = Self {
-            buffer: dst,
-            device,
-            count: dst_el,
-            dtype: self.dtype,
-        };
-        let l_out = params.l_out();
         let b = params.b_size;
         let n = params.c_out;
         let k = params.k_size * params.c_in;
-        let m = l_out;
-        // Produce the result already oriented as (b, c_out, l_out) rather than computing
-        // (b, l_out, c_out) and transposing it afterwards with a full strided copy. The GEMM
-        // accepts a transposed operand through its stride flags, so `kernel @ col^T` costs the
-        // same as `col @ kernel` while landing in the layout the caller wants. The transpose this
-        // replaces ran at ~20 GB/s (transposes coalesce badly) and measured 4x the cost of the
-        // matmul itself on a 221 MB tensor.
-        let col_l = Layout::contiguous((b, m, k)).transpose(1, 2)?;
+        let m = params.l_out();
+
+        // A kernel of size 1 with unit stride, no padding and no dilation has an im2col that is the
+        // identity: the matmul wants (b, k, l_out) and a contiguous (b, c_in, l_in) input already
+        // IS that, since k = c_in and l_out = l_in. Reading the input directly saves a copy of the
+        // whole im2col volume. See `conv2d` for the same shortcut and its measurement.
+        let im2col_is_identity = params.k_size == 1
+            && params.stride == 1
+            && params.padding == 0
+            && params.dilation == 1
+            && layout.is_contiguous();
+
+        let col_owned;
+        let (col, col_l) = if im2col_is_identity {
+            (
+                self,
+                Layout::contiguous_with_offset((b, k, m), layout.start_offset()),
+            )
+        } else {
+            let dst_el = b * m * k;
+            let dst = self
+                .device
+                .new_buffer_builder()
+                .with_size_for(dst_el, self.dtype)
+                .with_label("conv1d_im2col")
+                .build()?;
+            let encoder = self.device.command_encoder()?;
+            let name = match self.dtype {
+                DType::F32 => "im2col1d_f32",
+                DType::F16 => "im2col1d_f16",
+                DType::BF16 => "im2col1d_bf16",
+                DType::U8 => "im2col1d_u8",
+                DType::U32 => "im2col1d_u32",
+                dtype => crate::bail!("Metal conv1d {dtype:?} not implemented"),
+            };
+            let src = buffer_o(&self.buffer, layout, self.dtype);
+            candle_metal_kernels::call_im2col1d_strided(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                layout.shape().dims(),
+                layout.stride(),
+                (params.k_size, params.stride, params.padding, params.dilation),
+                src,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+            drop(encoder);
+            col_owned = Self {
+                buffer: dst,
+                device,
+                count: dst_el,
+                dtype: self.dtype,
+            };
+            // Produce the result already oriented as (b, c_out, l_out) rather than computing
+            // (b, l_out, c_out) and transposing it afterwards with a full strided copy. The GEMM
+            // accepts a transposed operand through its stride flags, so `kernel @ col^T` costs the
+            // same as `col @ kernel` while landing in the layout the caller wants. The transpose
+            // this replaces ran at ~20 GB/s (transposes coalesce badly) and measured 4x the cost of
+            // the matmul itself on a 221 MB tensor.
+            (&col_owned, Layout::contiguous((b, m, k)).transpose(1, 2)?)
+        };
+
         if kernel_l.is_contiguous() {
             let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
                 .broadcast_as((b, n, k))?;
-            kernel.matmul(&col, (b, n, m, k), &kernel_l, &col_l)
+            kernel.matmul(col, (b, n, m, k), &kernel_l, &col_l)
         } else {
             // Make the kernel contiguous if not already the case. The COPY has to be the operand:
             // describing the original strided buffer with a contiguous layout reads the wrong
@@ -981,7 +991,7 @@ impl BackendStorage for MetalStorage {
             let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
             let kernel_l = Layout::contiguous((1, n, k)).broadcast_as((b, n, k))?;
-            kernel_c.matmul(&col, (b, n, m, k), &kernel_l, &col_l)
+            kernel_c.matmul(col, (b, n, m, k), &kernel_l, &col_l)
         }
     }
 
@@ -1112,70 +1122,87 @@ impl BackendStorage for MetalStorage {
         params: &ParamsConv2D,
     ) -> Result<Self> {
         let device = self.device().clone();
-        let shape = layout.shape();
-        let dims = shape.dims();
-
-        let stride = params.stride;
-        let dilation = params.dilation;
-        let padding = params.padding;
-        let h_k = params.k_h;
-        let w_k = params.k_w;
-        let h = dims[2];
-        let w = dims[3];
-        let h_out = (h + 2 * padding - dilation * (h_k - 1) - 1) / stride + 1;
-        let w_out = (w + 2 * padding - dilation * (w_k - 1) - 1) / stride + 1;
-        let dst_el = dims[0] * h_out * w_out * dims[1] * h_k * w_k;
-
-        let dst = self
-            .device
-            .new_buffer_builder()
-            .with_size_for(dst_el, self.dtype)
-            .with_label("conv2d_im2col")
-            .build()?;
-        let encoder = self.device.command_encoder()?;
-        let name = match self.dtype {
-            DType::F32 => "im2col_f32",
-            DType::F16 => "im2col_f16",
-            DType::BF16 => "im2col_bf16",
-            DType::U8 => "im2col_u8",
-            DType::U32 => "im2col_u32",
-            dtype => crate::bail!("Metal conv2d {dtype:?} not implemented"),
-        };
-        let src = buffer_o(&self.buffer, layout, self.dtype);
-        candle_metal_kernels::call_im2col_strided(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            name,
-            layout.shape().dims(),
-            layout.stride(),
-            (h_k, w_k, stride, padding, dilation),
-            src,
-            &dst,
-        )
-        .map_err(MetalError::from)?;
-        drop(encoder);
-        let col = Self {
-            buffer: dst,
-            device,
-            count: dst_el,
-            dtype: self.dtype,
-        };
-        let h_out = params.out_h();
-        let w_out = params.out_w();
         let b = params.b_size;
         let n = params.c_out;
         let k = params.k_h * params.k_w * params.c_in;
-        let m = h_out * w_out;
-        // As in `conv1d`: compute the result already oriented as (b, c_out, h_out, w_out) instead
-        // of producing (b, h_out, w_out, c_out) and permuting it afterwards with a full strided
-        // copy. `(b, n, m)` contiguous IS `(b, c_out, h_out, w_out)` once m = h_out * w_out, so the
-        // copy simply disappears.
-        let col_l = Layout::contiguous((b, m, k)).transpose(1, 2)?;
+        let m = params.out_h() * params.out_w();
+
+        // A 1x1 convolution with unit stride, no padding and no dilation has an im2col that is the
+        // identity. The matmul below wants its right operand as (b, k, positions), and a contiguous
+        // (b, c_in, h, w) input already IS exactly that, since k = c_in and positions = h * w. So
+        // read the input directly instead of copying it to say the same thing twice: measured on
+        // ReDimNet-b6 stage 0, a 1x1 conv2d drops from 13.27 ms to 5.83 ms.
+        let im2col_is_identity = params.k_h == 1
+            && params.k_w == 1
+            && params.stride == 1
+            && params.padding == 0
+            && params.dilation == 1
+            && layout.is_contiguous();
+
+        let col_owned;
+        let (col, col_l) = if im2col_is_identity {
+            (
+                self,
+                Layout::contiguous_with_offset((b, k, m), layout.start_offset()),
+            )
+        } else {
+            let dst_el = b * m * k;
+            let dst = self
+                .device
+                .new_buffer_builder()
+                .with_size_for(dst_el, self.dtype)
+                .with_label("conv2d_im2col")
+                .build()?;
+            let encoder = self.device.command_encoder()?;
+            let name = match self.dtype {
+                DType::F32 => "im2col_f32",
+                DType::F16 => "im2col_f16",
+                DType::BF16 => "im2col_bf16",
+                DType::U8 => "im2col_u8",
+                DType::U32 => "im2col_u32",
+                dtype => crate::bail!("Metal conv2d {dtype:?} not implemented"),
+            };
+            let src = buffer_o(&self.buffer, layout, self.dtype);
+            candle_metal_kernels::call_im2col_strided(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                name,
+                layout.shape().dims(),
+                layout.stride(),
+                (
+                    params.k_h,
+                    params.k_w,
+                    params.stride,
+                    params.padding,
+                    params.dilation,
+                ),
+                src,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+            drop(encoder);
+            col_owned = Self {
+                buffer: dst,
+                device,
+                count: dst_el,
+                dtype: self.dtype,
+            };
+            // As in `conv1d`: compute the result already oriented as (b, c_out, h_out, w_out)
+            // instead of producing (b, h_out, w_out, c_out) and permuting it afterwards with a full
+            // strided copy. `(b, n, m)` contiguous IS `(b, c_out, h_out, w_out)` once
+            // m = h_out * w_out, so the copy simply disappears. The GEMM reads the columns
+            // transposed through its stride flags, which costs nothing.
+            (
+                &col_owned,
+                Layout::contiguous((b, m, k)).transpose(1, 2)?,
+            )
+        };
+
         if kernel_l.is_contiguous() {
             let kernel_l = Layout::contiguous_with_offset((1, n, k), kernel_l.start_offset())
                 .broadcast_as((b, n, k))?;
-            kernel.matmul(&col, (b, n, m, k), &kernel_l, &col_l)
+            kernel.matmul(col, (b, n, m, k), &kernel_l, &col_l)
         } else {
             // Make the kernel contiguous if not already the case. The COPY has to be the operand:
             // describing the original strided buffer with a contiguous layout reads the wrong
@@ -1183,7 +1210,7 @@ impl BackendStorage for MetalStorage {
             let mut kernel_c = self.device().zeros_impl(kernel_l.shape(), kernel.dtype())?;
             kernel.copy_strided_src(&mut kernel_c, 0, kernel_l)?;
             let kernel_l = Layout::contiguous((1, n, k)).broadcast_as((b, n, k))?;
-            kernel_c.matmul(&col, (b, n, m, k), &kernel_l, &col_l)
+            kernel_c.matmul(col, (b, n, m, k), &kernel_l, &col_l)
         }
     }
 
