@@ -999,6 +999,13 @@ fn conv2d_grouped(dev: &Device) -> Result<()> {
         (2, 2, 2, 2, 6, 6, 3, 3, 2, 1, 2),
         (2, 5, 2, 3, 4, 9, 2, 2, 1, 1, 1),
         (4, 8, 4, 4, 5, 5, 1, 1, 0, 1, 1),
+        // Added with the direct kernel: the axes it is generic over.
+        (1, 4, 32, 32, 6, 11, 3, 3, 1, 1, 1),  // the model's own group width
+        (2, 6, 8, 8, 5, 13, 3, 3, 1, 1, 1),    // non-square, groups 6
+        (2, 12, 1, 1, 9, 9, 3, 3, 1, 1, 1),    // depthwise via groups
+        (1, 2, 8, 8, 9, 9, 5, 5, 2, 1, 1),     // 5x5
+        (2, 2, 4, 4, 8, 8, 3, 3, 0, 2, 2),     // stride 2 AND dilation 2
+        (1, 3, 2, 6, 7, 5, 3, 3, 1, 1, 1),     // c_in_pg != c_out_pg
     ];
     for (i, &(b, groups, c_in_g, c_out_g, h, w, k_h, k_w, padding, stride, dilation)) in
         cases.iter().enumerate()
@@ -1052,6 +1059,19 @@ fn conv2d_grouped(dev: &Device) -> Result<()> {
         .max(0)?
         .to_scalar::<f32>()?;
     assert!(diff < 1e-5, "non-contiguous grouped conv2d differs by {diff}");
+
+    // f16 is not supported by the direct kernel and must fall back to im2col, still correctly.
+    if dev.is_metal() {
+        let t = Tensor::from_vec(lcg_vec(2 * 8 * 5 * 5, 31), (2, 8, 5, 5), dev)?;
+        let wt = Tensor::from_vec(lcg_vec(8 * 4 * 9, 37), (8, 4, 3, 3), dev)?;
+        let want = t.conv2d(&wt, 1, 1, 1, 2)?;
+        let got = t
+            .to_dtype(candle_core::DType::F16)?
+            .conv2d(&wt.to_dtype(candle_core::DType::F16)?, 1, 1, 1, 2)?
+            .to_dtype(candle_core::DType::F32)?;
+        let diff = (want - got)?.abs()?.flatten_all()?.max(0)?.to_scalar::<f32>()?;
+        assert!(diff < 5e-2, "f16 grouped conv2d fallback differs by {diff}");
+    }
 
     Ok(())
 }

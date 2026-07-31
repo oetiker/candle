@@ -1214,6 +1214,69 @@ impl BackendStorage for MetalStorage {
         }
     }
 
+    fn conv2d_grouped(
+        &self,
+        layout: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
+    ) -> Result<Option<Self>> {
+        // The direct kernel supports f32 with contiguous operands and a real (non-pointwise)
+        // window. Everything else returns None and takes the im2col path unchanged: a 1x1
+        // convolution already skips im2col entirely (see `conv2d`), so there is nothing to win
+        // there, and a strided layout would need the gather to carry per-axis strides.
+        if self.dtype != DType::F32
+            || kernel.dtype != DType::F32
+            || !layout.is_contiguous()
+            || !kernel_l.is_contiguous()
+            || params.k_h * params.k_w == 1
+        {
+            return Ok(None);
+        }
+
+        let (h_out, w_out) = (params.out_h(), params.out_w());
+        let dst_el = params.b_size * params.c_out * params.groups * h_out * w_out;
+        let buffer = self
+            .device
+            .new_buffer_builder()
+            .with_size_for(dst_el, self.dtype)
+            .with_label("conv2d_grouped_direct")
+            .build()?;
+
+        let encoder = self.device.command_encoder()?;
+        candle_metal_kernels::call_conv2d_grouped_direct(
+            &self.device.device,
+            &encoder,
+            &self.device.kernels,
+            "conv2d_grouped_direct_f32",
+            candle_metal_kernels::Conv2dGroupedCfg {
+                b_size: params.b_size,
+                groups: params.groups,
+                c_in_pg: params.c_in,
+                c_out_pg: params.c_out,
+                h_in: params.i_h,
+                w_in: params.i_w,
+                h_out,
+                w_out,
+                k_h: params.k_h,
+                k_w: params.k_w,
+                stride: params.stride,
+                padding: params.padding,
+                dilation: params.dilation,
+            },
+            buffer_o(&self.buffer, layout, self.dtype),
+            buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
+        Ok(Some(Self::new(
+            buffer,
+            self.device.clone(),
+            dst_el,
+            self.dtype,
+        )))
+    }
+
     fn conv_transpose2d(
         &self,
         l: &Layout,

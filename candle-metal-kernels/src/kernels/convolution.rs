@@ -312,6 +312,72 @@ pub fn call_conv_transpose1d(
     Ok(())
 }
 
+/// Everything `call_conv2d_grouped_direct` needs that is not a buffer. Grouped: the input has
+/// `groups * c_in_pg` channels and the output `groups * c_out_pg`.
+#[derive(Debug, Clone, Copy)]
+pub struct Conv2dGroupedCfg {
+    pub b_size: usize,
+    pub groups: usize,
+    pub c_in_pg: usize,
+    pub c_out_pg: usize,
+    pub h_in: usize,
+    pub w_in: usize,
+    pub h_out: usize,
+    pub w_out: usize,
+    pub k_h: usize,
+    pub k_w: usize,
+    pub stride: usize,
+    pub padding: usize,
+    pub dilation: usize,
+}
+
+/// A grouped 2-D convolution computed directly, without materialising im2col.
+///
+/// One thread per output element. The caller guarantees contiguous `input` and `weight`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv2d_grouped_direct(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    cfg: Conv2dGroupedCfg,
+    input: BufferOffset,
+    weight: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    let dst_el = cfg.b_size * cfg.groups * cfg.c_out_pg * cfg.h_out * cfg.w_out;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "conv2d_grouped_direct {name} dst_el={dst_el}");
+    set_params!(
+        encoder,
+        (
+            dst_el,
+            cfg.groups,
+            cfg.c_in_pg,
+            cfg.c_out_pg,
+            cfg.h_in,
+            cfg.w_in,
+            cfg.h_out,
+            cfg.w_out,
+            cfg.k_h,
+            cfg.k_w,
+            cfg.stride,
+            cfg.padding,
+            cfg.dilation,
+            &input,
+            &weight,
+            Output::new(output)
+        )
+    );
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
 pub struct CallConvTranspose2dCfg<'a> {
     pub dilation: usize,
     pub stride: usize,
