@@ -461,6 +461,36 @@ impl Storage {
         }
     }
 
+    /// See [`crate::backend::BackendStorage::conv2d_grouped`]. `Ok(None)` means the backend has no
+    /// fused grouped path and the caller should convolve one group at a time.
+    pub(crate) fn conv2d_grouped(
+        &self,
+        l: &Layout,
+        kernel: &Self,
+        kernel_l: &Layout,
+        params: &crate::conv::ParamsConv2D,
+    ) -> Result<Option<Self>> {
+        self.same_device(kernel, "conv2d")?;
+        self.same_dtype(kernel, "conv2d")?;
+        match (self, &kernel) {
+            (Storage::Cpu(inp), Storage::Cpu(kernel)) => {
+                Ok(inp.conv2d_grouped(l, kernel, kernel_l, params)?.map(Self::Cpu))
+            }
+            (Storage::Cuda(inp), Storage::Cuda(kernel)) => Ok(inp
+                .conv2d_grouped(l, kernel, kernel_l, params)?
+                .map(Self::Cuda)),
+            (Storage::Metal(inp), Storage::Metal(kernel)) => Ok(inp
+                .conv2d_grouped(l, kernel, kernel_l, params)?
+                .map(Self::Metal)),
+            (lhs, rhs) => Err(Error::DeviceMismatchBinaryOp {
+                lhs: lhs.device().location(),
+                rhs: rhs.device().location(),
+                op: "conv2d",
+            }
+            .bt()),
+        }
+    }
+
     pub(crate) fn conv_transpose2d(
         &self,
         l: &Layout,

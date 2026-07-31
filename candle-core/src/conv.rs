@@ -75,11 +75,18 @@ pub struct ParamsConv2D {
     pub(crate) i_w: usize,
     pub(crate) k_h: usize,
     pub(crate) k_w: usize,
+    /// Out-channels **per group**.
     pub(crate) c_out: usize,
+    /// In-channels **per group**.
     pub(crate) c_in: usize,
     pub(crate) padding: usize,
     pub(crate) stride: usize,
     pub(crate) dilation: usize,
+    /// Number of convolution groups. The input carries `c_in * groups` channels and the output
+    /// `c_out * groups`. Backends that do not implement [`crate::backend::BackendStorage::
+    /// conv2d_grouped`] never see a value other than `1`: the caller splits the convolution into
+    /// one call per group and each call describes a single group.
+    pub(crate) groups: usize,
     pub cudnn_fwd_algo: Option<CudnnFwdAlgo>,
 }
 
@@ -93,7 +100,12 @@ impl ParamsConv2D {
     }
 
     pub(crate) fn out_dims(&self) -> Vec<usize> {
-        vec![self.b_size, self.c_out, self.out_h(), self.out_w()]
+        vec![
+            self.b_size,
+            self.c_out * self.groups,
+            self.out_h(),
+            self.out_w(),
+        ]
     }
 }
 
@@ -324,11 +336,38 @@ impl Tensor {
             padding,
             stride,
             dilation,
+            groups,
             cudnn_fwd_algo,
         };
         if groups == 1 {
             self.conv2d_single_group(kernel, &params)
         } else {
+            // Backends may implement the whole grouped convolution as a single im2col plus one
+            // batched matmul, which is dramatically cheaper than one convolution per group. The
+            // fused path is opt-in: a backend that does not provide it returns `None` and we fall
+            // back to the split below. It is also skipped whenever a gradient is being tracked,
+            // since `Op::Conv2D` carries no group count and the split form is what backprop knows
+            // how to differentiate.
+            if !self.track_op() && !kernel.track_op() {
+                if let Some(storage) = self.storage().conv2d_grouped(
+                    self.layout(),
+                    &kernel.storage(),
+                    kernel.layout(),
+                    &params,
+                )? {
+                    let out_dims = params.out_dims();
+                    return Ok(crate::tensor::from_storage(
+                        storage,
+                        out_dims,
+                        BackpropOp::none(),
+                        false,
+                    ));
+                }
+            }
+            let params = ParamsConv2D {
+                groups: 1,
+                ..params
+            };
             let blocks = self.chunk(groups, 1)?;
             let kernel = kernel.chunk(groups, 0)?;
             let blocks = blocks

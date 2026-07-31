@@ -57,6 +57,23 @@ pub trait BackendStorage: Sized {
         _params: &crate::conv::ParamsConv2D,
     ) -> Result<Self>;
 
+    /// Grouped 2D convolution, computed in one shot rather than one convolution per group.
+    ///
+    /// `params.groups` is `> 1` here and `params.c_in` / `params.c_out` are per-group counts, so
+    /// the input has `c_in * groups` channels and the output `c_out * groups`. Returning `Ok(None)`
+    /// means "not implemented"; the caller then splits the convolution into one [`Self::conv2d`]
+    /// call per group. The default is therefore correct for every backend and only backends that
+    /// override it change behaviour.
+    fn conv2d_grouped(
+        &self,
+        _l: &Layout,
+        _kernel: &Self,
+        _kernel_l: &Layout,
+        _params: &crate::conv::ParamsConv2D,
+    ) -> Result<Option<Self>> {
+        Ok(None)
+    }
+
     fn conv_transpose2d(
         &self,
         _l: &Layout,
