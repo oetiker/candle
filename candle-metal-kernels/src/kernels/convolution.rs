@@ -1,10 +1,10 @@
 use crate::linear_split;
 use crate::utils::{BufferOffset, EncoderProvider};
-use objc2_metal::MTLSize;
 use crate::{
     debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
     Output, Source,
 };
+use objc2_metal::MTLSize;
 
 #[allow(clippy::too_many_arguments)]
 pub fn call_im2col1d_strided(
@@ -396,7 +396,7 @@ pub fn call_conv2d_grouped_direct(
 /// `TILE_T` would silently compute the wrong columns.
 #[derive(Debug, Clone, Copy)]
 pub struct Conv2dGroupedTiledVariant {
-    /// Shader entry point, e.g. `conv2d_grouped_tiled_f32_t128_c8_r8x8`.
+    /// Shader entry point, e.g. `conv2d_grouped_tiled_f32_t224_c4_r8x4`.
     pub name: &'static str,
     /// `TILE_T`: output columns per threadgroup.
     pub tile_t: usize,

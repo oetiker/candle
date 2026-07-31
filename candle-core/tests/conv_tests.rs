@@ -1166,14 +1166,23 @@ test_device!(
 /// hide here. The tiled variant is selected by the backend predicate (3x3, stride 1, padding 1,
 /// 32 out-channels per group), so `c_out_pg == 32` exercises it and 16 exercises the simple kernel,
 /// which is the second independent implementation of the same thing.
+///
+/// At least one case MUST be wider than `TILE_T` (224). The grid is `w_out.div_ceil(TILE_T)`
+/// threadgroups across, so a suite of narrow cases only ever runs `tgid.x == 0`, which makes `x0`
+/// identically zero and leaves both of its uses — the halo base `x0 + scol - 1` and the output
+/// column `x0 + t_blk + j * NT` — completely untested. Production runs 667 columns, i.e. three
+/// tiles. Verified by sabotage: dropping the `TILE_T` multiplier from `x0` leaves every case
+/// narrower than a tile green and fails exactly the multi-tile ones.
 fn conv2d_grouped_tiled_matches(dev: &Device) -> Result<()> {
     // (b, groups, c_in_pg, c_out_pg, h, w)
     let cases = [
         (1, 4, 32, 32, 6, 67),  // the model's stage-3/4 shape, scaled down in time
-        (2, 2, 32, 32, 5, 13),  // narrower than one tile
-        (1, 3, 32, 32, 4, 130), // wider than one tile, and not a multiple of it
+        (2, 2, 32, 32, 5, 13),  // far narrower than one tile
+        (1, 3, 32, 32, 4, 130), // one partial tile: 94 of the 224 columns masked off on write
         (2, 2, 8, 32, 7, 9),    // c_in_pg != c_out_pg, still a multiple of CI_CHUNK
         (1, 2, 32, 32, 3, 224), // exactly one tile wide
+        (1, 2, 32, 32, 3, 500), // THREE tiles, the last partial: exercises x0 != 0
+        (1, 2, 32, 32, 3, 448), // exactly two tiles: multi-tile with no partial tile
         (2, 3, 20, 32, 5, 200), // c_in_pg a multiple of CI_CHUNK but not of 32
         (1, 2, 32, 16, 6, 70),  // c_out_pg != 32: the simple kernel, same oracle
         (1, 2, 6, 32, 4, 40),   // c_in_pg not a multiple of CI_CHUNK: the simple kernel again
@@ -1181,7 +1190,11 @@ fn conv2d_grouped_tiled_matches(dev: &Device) -> Result<()> {
     for (i, &(b, groups, c_in_pg, c_out_pg, h, w)) in cases.iter().enumerate() {
         let c_in = c_in_pg * groups;
         let c_out = c_out_pg * groups;
-        let t = Tensor::from_vec(lcg_vec(b * c_in * h * w, 5000 + i as u64), (b, c_in, h, w), dev)?;
+        let t = Tensor::from_vec(
+            lcg_vec(b * c_in * h * w, 5000 + i as u64),
+            (b, c_in, h, w),
+            dev,
+        )?;
         let wt = Tensor::from_vec(
             lcg_vec(c_out * c_in_pg * 9, 6000 + i as u64),
             (c_out, c_in_pg, 3, 3),
@@ -1204,7 +1217,10 @@ fn conv2d_grouped_tiled_matches(dev: &Device) -> Result<()> {
             .flatten_all()?
             .max(0)?
             .to_scalar::<f32>()?;
-        assert!(diff < 1e-4, "case {i}: tiled grouped conv2d differs by {diff}");
+        assert!(
+            diff < 1e-4,
+            "case {i}: tiled grouped conv2d differs by {diff}"
+        );
     }
     Ok(())
 }

@@ -761,10 +761,14 @@ kernel void FN_NAME( \
 // Where the reuse comes from. Each thread owns a REGISTER TILE of CO_REG output channels by T_REG
 // output columns. For every (input channel, ky, kx) it loads CO_REG weights and T_REG activations
 // out of threadgroup memory and issues CO_REG * T_REG fused multiply-adds against them, so the
-// ratio of arithmetic to threadgroup traffic is CO_REG * T_REG / (CO_REG + T_REG) -- 4.0 at
-// 8x8, against 9/45 for a kernel that keeps no register tile at all. The weight slab is read from
-// device memory once per threadgroup instead of once per output element, which is what the simple
-// one-thread-per-output kernel does.
+// ratio of arithmetic to threadgroup traffic is CO_REG * T_REG / (CO_REG + T_REG) -- 2.67 at the
+// shipped 8x4, against 0.8 for a kernel that gives each thread a single output column and keeps no
+// register tile across columns at all. The weight slab is read from device memory once per
+// threadgroup instead of once per output element, which is what the simple one-thread-per-output
+// kernel does.
+//
+// 8x4 is not a compromise but a measured ceiling: CO_REG * T_REG == 64 live accumulators spill and
+// run SLOWER than the simple kernel, so raising the ratio past 2.67 by widening the tile loses.
 //
 // The T_REG columns a thread owns are INTERLEAVED (column t_blk + j * NT, not t_blk * T_REG + j) so
 // that lane-adjacent threads touch adjacent threadgroup words and adjacent destination addresses.
@@ -788,6 +792,10 @@ METAL_FUNC void conv2d_grouped_tiled(
   const uint SX_ROW = TILE_T + 2;           // one staged input row, halo included
   const uint NT = TILE_T / T_REG;           // column blocks == threads per channel block
   const uint threads = NT * (TILE_CO / CO_REG);
+  // Both divisions above must be exact, or the thread mapping stops covering the tile and columns
+  // or channels are silently dropped. Fail at compile time instead.
+  static_assert(TILE_T % T_REG == 0, "TILE_T must be a multiple of T_REG");
+  static_assert(TILE_CO % CO_REG == 0, "32 output channels must be a multiple of CO_REG");
 
   const uint t_blk = tix % NT;
   const uint co0 = (tix / NT) * CO_REG;
