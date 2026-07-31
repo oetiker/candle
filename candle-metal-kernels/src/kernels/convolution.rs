@@ -1,5 +1,6 @@
 use crate::linear_split;
 use crate::utils::{BufferOffset, EncoderProvider};
+use objc2_metal::MTLSize;
 use crate::{
     debug_group, set_params, Buffer, ComputeCommandEncoder, Device, Kernels, MetalKernelError,
     Output, Source,
@@ -386,6 +387,67 @@ pub fn call_conv2d_grouped_direct(
         )
     );
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
+
+/// One instantiated `conv2d_grouped_tiled` pipeline: its entry point plus the tile constants the
+/// shader was compiled with. The dispatch geometry is a function of these, so they must be quoted
+/// from the same place the entry point is chosen — a `tile_t` that disagrees with the compiled
+/// `TILE_T` would silently compute the wrong columns.
+#[derive(Debug, Clone, Copy)]
+pub struct Conv2dGroupedTiledVariant {
+    /// Shader entry point, e.g. `conv2d_grouped_tiled_f32_t128_c8_r8x8`.
+    pub name: &'static str,
+    /// `TILE_T`: output columns per threadgroup.
+    pub tile_t: usize,
+    /// `CI_CHUNK`: input channels staged per pass. `c_in_pg` must be a multiple of it.
+    pub ci_chunk: usize,
+    /// `(TILE_T / T_REG) * (32 / CO_REG)`: threads per threadgroup.
+    pub threads: usize,
+}
+
+/// The tiled grouped conv2d. Only valid for the restricted case the shader documents:
+/// `k_h == k_w == 3`, `stride == 1`, `dilation == 1`, `padding == 1`, `c_out_pg == 32`, and
+/// `c_in_pg` a multiple of `variant.ci_chunk`.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv2d_grouped_tiled(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    variant: Conv2dGroupedTiledVariant,
+    cfg: Conv2dGroupedCfg,
+    input: BufferOffset,
+    weight: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, variant.name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "conv2d_grouped_tiled {}", variant.name);
+    set_params!(
+        encoder,
+        (
+            cfg.groups,
+            cfg.c_in_pg,
+            cfg.h_in,
+            cfg.w_in,
+            &input,
+            &weight,
+            Output::new(output)
+        )
+    );
+    let grid_dims = MTLSize {
+        width: cfg.w_out.div_ceil(variant.tile_t),
+        height: cfg.h_out,
+        depth: cfg.b_size * cfg.groups,
+    };
+    let group_dims = MTLSize {
+        width: variant.threads,
+        height: 1,
+        depth: 1,
+    };
+    encoder.dispatch_thread_groups(grid_dims, group_dims);
     Ok(())
 }
 

@@ -1158,9 +1158,67 @@ test_device!(
     conv_pointwise_metal
 );
 
+/// The tiled grouped conv2d against the same convolution done one group at a time.
+///
+/// The per-group form is genuinely independent code on Metal: `Tensor::conv2d` with `groups == 1`
+/// never reaches the grouped hook at all (see `conv.rs`), so it goes through im2col plus GEMM while
+/// the fused call goes through the tiled shader. A shared misreading of the layout therefore cannot
+/// hide here. The tiled variant is selected by the backend predicate (3x3, stride 1, padding 1,
+/// 32 out-channels per group), so `c_out_pg == 32` exercises it and 16 exercises the simple kernel,
+/// which is the second independent implementation of the same thing.
+fn conv2d_grouped_tiled_matches(dev: &Device) -> Result<()> {
+    // (b, groups, c_in_pg, c_out_pg, h, w)
+    let cases = [
+        (1, 4, 32, 32, 6, 67),  // the model's stage-3/4 shape, scaled down in time
+        (2, 2, 32, 32, 5, 13),  // narrower than one tile
+        (1, 3, 32, 32, 4, 130), // wider than one tile, and not a multiple of it
+        (2, 2, 8, 32, 7, 9),    // c_in_pg != c_out_pg, still a multiple of CI_CHUNK
+        (1, 2, 32, 32, 3, 128), // exactly one tile wide
+        (2, 3, 24, 32, 5, 200), // c_in_pg a multiple of 8 but not of 32
+        (1, 2, 32, 16, 6, 70),  // c_out_pg != 32: the simple kernel, same oracle
+        (1, 2, 12, 32, 4, 40),  // c_in_pg not a multiple of 8: the simple kernel again
+    ];
+    for (i, &(b, groups, c_in_pg, c_out_pg, h, w)) in cases.iter().enumerate() {
+        let c_in = c_in_pg * groups;
+        let c_out = c_out_pg * groups;
+        let t = Tensor::from_vec(lcg_vec(b * c_in * h * w, 5000 + i as u64), (b, c_in, h, w), dev)?;
+        let wt = Tensor::from_vec(
+            lcg_vec(c_out * c_in_pg * 9, 6000 + i as u64),
+            (c_out, c_in_pg, 3, 3),
+            dev,
+        )?;
+        let got = t.conv2d(&wt, 1, 1, 1, groups)?;
+
+        let per_group = (0..groups)
+            .map(|g| {
+                let ti = t.narrow(1, g * c_in_pg, c_in_pg)?;
+                let wi = wt.narrow(0, g * c_out_pg, c_out_pg)?;
+                ti.conv2d(&wi, 1, 1, 1, 1)
+            })
+            .collect::<candle_core::Result<Vec<_>>>()?;
+        let expected = Tensor::cat(&per_group, 1)?;
+
+        assert_eq!(got.dims(), expected.dims(), "case {i}: shape");
+        let diff = (got - expected)?
+            .abs()?
+            .flatten_all()?
+            .max(0)?
+            .to_scalar::<f32>()?;
+        assert!(diff < 1e-4, "case {i}: tiled grouped conv2d differs by {diff}");
+    }
+    Ok(())
+}
+
 test_device!(
     conv2d_grouped,
     conv2d_grouped_cpu,
     conv2d_grouped_gpu,
     conv2d_grouped_metal
+);
+
+test_device!(
+    conv2d_grouped_tiled_matches,
+    conv2d_grouped_tiled_matches_cpu,
+    conv2d_grouped_tiled_matches_gpu,
+    conv2d_grouped_tiled_matches_metal
 );

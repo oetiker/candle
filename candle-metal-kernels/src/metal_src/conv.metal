@@ -751,6 +751,156 @@ kernel void FN_NAME( \
                            k_h, k_w, stride, padding, dilation, src, weight, dst, tid); \
 } \
 
+// Implicit GEMM: out[c_out_pg, P] = W[c_out_pg, c_in_pg * 9] x Xcol[.., P], where Xcol is gathered
+// into threadgroup memory and NEVER written to device memory. One threadgroup per
+// (batch * group, output row, tile of TILE_T output columns).
+//
+// Restricted, by the dispatch predicate, to: stride 1, dilation 1, k_h == k_w == 3, padding 1,
+// c_out_pg == 32, c_in_pg a multiple of CI_CHUNK. Anything else uses the simple kernel.
+//
+// Where the reuse comes from. Each thread owns a REGISTER TILE of CO_REG output channels by T_REG
+// output columns. For every (input channel, ky, kx) it loads CO_REG weights and T_REG activations
+// out of threadgroup memory and issues CO_REG * T_REG fused multiply-adds against them, so the
+// ratio of arithmetic to threadgroup traffic is CO_REG * T_REG / (CO_REG + T_REG) -- 4.0 at
+// 8x8, against 9/45 for a kernel that keeps no register tile at all. The weight slab is read from
+// device memory once per threadgroup instead of once per output element, which is what the simple
+// one-thread-per-output kernel does.
+//
+// The T_REG columns a thread owns are INTERLEAVED (column t_blk + j * NT, not t_blk * T_REG + j) so
+// that lane-adjacent threads touch adjacent threadgroup words and adjacent destination addresses.
+// A contiguous per-thread run would make the threadgroup stride T_REG words and serialise the
+// loads across banks.
+template <typename T, uint TILE_T, uint CI_CHUNK, uint CO_REG, uint T_REG>
+METAL_FUNC void conv2d_grouped_tiled(
+    constant size_t &groups,
+    constant size_t &c_in_pg,
+    constant size_t &h_in,
+    constant size_t &w_in,
+    device const T *src,
+    device const T *weight,
+    device T *dst,
+    threadgroup float *sx,
+    threadgroup float *sw,
+    uint3 tgid,
+    uint tix
+) {
+  const uint TILE_CO = 32;                  // == c_out_pg, enforced by the predicate
+  const uint SX_ROW = TILE_T + 2;           // one staged input row, halo included
+  const uint NT = TILE_T / T_REG;           // column blocks == threads per channel block
+  const uint threads = NT * (TILE_CO / CO_REG);
+
+  const uint t_blk = tix % NT;
+  const uint co0 = (tix / NT) * CO_REG;
+
+  const uint groups_u = uint(groups);
+  const uint g = tgid.z % groups_u;
+  const uint b_idx = tgid.z / groups_u;
+  const uint y_out = tgid.y;
+  const uint x0 = tgid.x * TILE_T;
+
+  const uint h_in_u = uint(h_in);
+  const uint w_in_u = uint(w_in);
+  const uint c_in_pg_u = uint(c_in_pg);
+
+  float acc[CO_REG][T_REG];
+  for (uint r = 0; r < CO_REG; ++r) {
+    for (uint j = 0; j < T_REG; ++j) {
+      acc[r][j] = 0.0f;
+    }
+  }
+
+  const size_t plane = (size_t)h_in_u * (size_t)w_in_u;
+  const size_t src_g =
+    ((size_t)b_idx * (size_t)(c_in_pg_u * groups_u) + (size_t)(g * c_in_pg_u)) * plane;
+  const size_t w_g = (size_t)(g * TILE_CO) * (size_t)c_in_pg_u * 9;
+
+  for (uint ci0 = 0; ci0 < c_in_pg_u; ci0 += CI_CHUNK) {
+    // --- stage the input tile: CI_CHUNK channels x 3 rows x (TILE_T + 2) columns ---
+    // sx[((sc * 3) + sr) * SX_ROW + scol] holds input column x0 + scol - 1, row y_out + sr - 1.
+    for (uint slot = tix; slot < CI_CHUNK * 3 * SX_ROW; slot += threads) {
+      const uint sc = slot / (3 * SX_ROW);
+      const uint rem = slot - sc * (3 * SX_ROW);
+      const uint sr = rem / SX_ROW;
+      const uint scol = rem - sr * SX_ROW;
+      const int iy = int(y_out) + int(sr) - 1;   // padding == 1
+      const int ix = int(x0) + int(scol) - 1;
+      float v = 0.0f;
+      if (iy >= 0 && iy < int(h_in_u) && ix >= 0 && ix < int(w_in_u)) {
+        v = float(src[src_g + (size_t)(ci0 + sc) * plane
+                    + (size_t)uint(iy) * (size_t)w_in_u + (size_t)uint(ix)]);
+      }
+      sx[slot] = v;
+    }
+    // --- stage the weight slab, laid out [ci][tap][c_out] so a whole channel block of weights is
+    // contiguous and lane-uniform in the inner loop ---
+    for (uint slot = tix; slot < CI_CHUNK * 9 * TILE_CO; slot += threads) {
+      const uint sc = slot / (9 * TILE_CO);
+      const uint rem = slot - sc * (9 * TILE_CO);
+      const uint tap = rem / TILE_CO;
+      const uint sco = rem - tap * TILE_CO;
+      sw[slot] = float(weight[w_g + (size_t)sco * (size_t)c_in_pg_u * 9
+                            + (size_t)(ci0 + sc) * 9 + (size_t)tap]);
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // --- the register-tiled inner product ---
+    for (uint sc = 0; sc < CI_CHUNK; ++sc) {
+      for (uint ky = 0; ky < 3; ++ky) {
+        for (uint kx = 0; kx < 3; ++kx) {
+          float wv[CO_REG];
+          for (uint r = 0; r < CO_REG; ++r) {
+            wv[r] = sw[(sc * 9 + ky * 3 + kx) * TILE_CO + co0 + r];
+          }
+          float xv[T_REG];
+          for (uint j = 0; j < T_REG; ++j) {
+            xv[j] = sx[(sc * 3 + ky) * SX_ROW + t_blk + j * NT + kx];
+          }
+          for (uint r = 0; r < CO_REG; ++r) {
+            for (uint j = 0; j < T_REG; ++j) {
+              acc[r][j] += wv[r] * xv[j];
+            }
+          }
+        }
+      }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+  }
+
+  // stride 1 and padding 1 with a 3x3 window => h_out == h_in and w_out == w_in.
+  const size_t dst_base =
+    ((size_t)b_idx * (size_t)(TILE_CO * groups_u) + (size_t)(g * TILE_CO)) * plane
+    + (size_t)y_out * (size_t)w_in_u;
+  for (uint j = 0; j < T_REG; ++j) {
+    const uint x_out = x0 + t_blk + j * NT;
+    if (x_out >= w_in_u) {
+      continue;
+    }
+    for (uint r = 0; r < CO_REG; ++r) {
+      dst[dst_base + (size_t)(co0 + r) * plane + (size_t)x_out] = static_cast<T>(acc[r][j]);
+    }
+  }
+}
+
+// The threadgroup arrays are declared in the kernel entry point: Metal only allows threadgroup
+// address space variables at kernel scope, so they are passed down as pointers.
+#define CONV2D_GROUPED_TILED_OP(T, TILE_T, CI_CHUNK, CO_REG, T_REG, FN_NAME) \
+kernel void FN_NAME( \
+    constant size_t &groups, \
+    constant size_t &c_in_pg, \
+    constant size_t &h_in, \
+    constant size_t &w_in, \
+    device const T *src, \
+    device const T *weight, \
+    device T *dst, \
+    uint3 tgid [[ threadgroup_position_in_grid ]], \
+    uint tix [[ thread_index_in_threadgroup ]] \
+) { \
+  threadgroup float sx[CI_CHUNK * 3 * (TILE_T + 2)]; \
+  threadgroup float sw[CI_CHUNK * 9 * 32]; \
+  conv2d_grouped_tiled<T, TILE_T, CI_CHUNK, CO_REG, T_REG>( \
+    groups, c_in_pg, h_in, w_in, src, weight, dst, sx, sw, tgid, tix); \
+} \
+
 IM2COL_OP(float, im2col_f32)
 IM2COL_OP(half, im2col_f16)
 IM2COL_OP(uint8_t, im2col_u8)
@@ -822,3 +972,14 @@ CONVT2D_OP(bfloat, float, conv_transpose2d_bf16)
 #endif
 
 CONV2D_GROUPED_DIRECT_OP(float, conv2d_grouped_direct_f32)
+
+// Tile variants for the sweep. Threadgroup memory used is
+// (CI_CHUNK * 3 * (TILE_T + 2) + CI_CHUNK * 288) * 4 bytes, against a 32 KB limit; thread count is
+// (TILE_T / T_REG) * (32 / CO_REG), against a 1024 limit.
+CONV2D_GROUPED_TILED_OP(float, 64, 8, 8, 4, conv2d_grouped_tiled_f32_t64_c8_r8x4)
+CONV2D_GROUPED_TILED_OP(float, 64, 16, 8, 4, conv2d_grouped_tiled_f32_t64_c16_r8x4)
+CONV2D_GROUPED_TILED_OP(float, 128, 8, 8, 4, conv2d_grouped_tiled_f32_t128_c8_r8x4)
+CONV2D_GROUPED_TILED_OP(float, 128, 8, 4, 8, conv2d_grouped_tiled_f32_t128_c8_r4x8)
+CONV2D_GROUPED_TILED_OP(float, 128, 8, 8, 8, conv2d_grouped_tiled_f32_t128_c8_r8x8)
+CONV2D_GROUPED_TILED_OP(float, 256, 4, 8, 4, conv2d_grouped_tiled_f32_t256_c4_r8x4)
+CONV2D_GROUPED_TILED_OP(float, 256, 4, 8, 8, conv2d_grouped_tiled_f32_t256_c4_r8x8)

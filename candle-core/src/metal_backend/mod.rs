@@ -1263,6 +1263,25 @@ impl BackendStorage for MetalStorage {
         if u32::try_from(dst_el).is_err() {
             return Ok(None);
         }
+        // The tiled kernel handles only the restricted 3x3 / stride-1 / pad-1 case with 32 output
+        // channels per group -- which is every grouped convolution in the residual blocks. It
+        // beats the simple kernel by amortising the weight slab over a tile of positions.
+        // Anything outside that falls through to the simple kernel below.
+        const TILED: candle_metal_kernels::Conv2dGroupedTiledVariant =
+            candle_metal_kernels::Conv2dGroupedTiledVariant {
+                name: "conv2d_grouped_tiled_f32_t128_c8_r8x8",
+                tile_t: 128,
+                ci_chunk: 8,
+                threads: 64,
+            };
+        let tiled = params.k_h == 3
+            && params.k_w == 3
+            && params.stride == 1
+            && params.padding == 1
+            && params.dilation == 1
+            && params.c_out == 32
+            && params.c_in % TILED.ci_chunk == 0;
+
         let buffer = self
             .device
             .new_buffer_builder()
@@ -1271,17 +1290,31 @@ impl BackendStorage for MetalStorage {
             .build()?;
 
         let encoder = self.device.command_encoder()?;
-        candle_metal_kernels::call_conv2d_grouped_direct(
-            &self.device.device,
-            &encoder,
-            &self.device.kernels,
-            "conv2d_grouped_direct_f32",
-            cfg,
-            buffer_o(&self.buffer, layout, self.dtype),
-            buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
-            &buffer,
-        )
-        .map_err(MetalError::from)?;
+        if tiled {
+            candle_metal_kernels::call_conv2d_grouped_tiled(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                TILED,
+                cfg,
+                buffer_o(&self.buffer, layout, self.dtype),
+                buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
+                &buffer,
+            )
+            .map_err(MetalError::from)?;
+        } else {
+            candle_metal_kernels::call_conv2d_grouped_direct(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                "conv2d_grouped_direct_f32",
+                cfg,
+                buffer_o(&self.buffer, layout, self.dtype),
+                buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
+                &buffer,
+            )
+            .map_err(MetalError::from)?;
+        }
         Ok(Some(Self::new(
             buffer,
             self.device.clone(),
