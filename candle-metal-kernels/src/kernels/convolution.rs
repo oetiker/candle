@@ -331,6 +331,17 @@ pub struct Conv2dGroupedCfg {
     pub dilation: usize,
 }
 
+impl Conv2dGroupedCfg {
+    /// The number of output elements: `b * groups * c_out_pg * h_out * w_out`. The single
+    /// source of truth for this product — the caller (`MetalStorage::conv2d_grouped`) uses it
+    /// both to size the output buffer and to decide whether the shader's `uint`-based (32-bit)
+    /// destination decode can represent every index without wrapping, so it must never drift
+    /// from what this function actually dispatches.
+    pub fn dst_el(&self) -> usize {
+        self.b_size * self.groups * self.c_out_pg * self.h_out * self.w_out
+    }
+}
+
 /// A grouped 2-D convolution computed directly, without materialising im2col.
 ///
 /// One thread per output element. The caller guarantees contiguous `input` and `weight`.
@@ -346,7 +357,7 @@ pub fn call_conv2d_grouped_direct(
     output: &Buffer,
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
-    let dst_el = cfg.b_size * cfg.groups * cfg.c_out_pg * cfg.h_out * cfg.w_out;
+    let dst_el = cfg.dst_el();
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();

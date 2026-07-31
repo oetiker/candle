@@ -1235,7 +1235,34 @@ impl BackendStorage for MetalStorage {
         }
 
         let (h_out, w_out) = (params.out_h(), params.out_w());
-        let dst_el = params.b_size * params.c_out * params.groups * h_out * w_out;
+        let cfg = candle_metal_kernels::Conv2dGroupedCfg {
+            b_size: params.b_size,
+            groups: params.groups,
+            c_in_pg: params.c_in,
+            c_out_pg: params.c_out,
+            h_in: params.i_h,
+            w_in: params.i_w,
+            h_out,
+            w_out,
+            k_h: params.k_h,
+            k_w: params.k_w,
+            stride: params.stride,
+            padding: params.padding,
+            dilation: params.dilation,
+        };
+        // `cfg.dst_el()` is the single source of truth shared with `call_conv2d_grouped_direct`
+        // (see its doc comment), so this check and the buffer allocation below can never
+        // disagree with what the shader actually dispatches.
+        //
+        // The shader decodes `thread_position_in_grid` (a `uint`) into (b, co, y, x) with 32-bit
+        // arithmetic for speed -- 64-bit division is emulated in software on this GPU. That
+        // decode silently wraps once `dst_el` exceeds `u32::MAX`, so decline here and fall back
+        // to the always-correct im2col path rather than dispatch a kernel that would compute
+        // wrapped indices past that ceiling.
+        let dst_el = cfg.dst_el();
+        if u32::try_from(dst_el).is_err() {
+            return Ok(None);
+        }
         let buffer = self
             .device
             .new_buffer_builder()
@@ -1249,21 +1276,7 @@ impl BackendStorage for MetalStorage {
             &encoder,
             &self.device.kernels,
             "conv2d_grouped_direct_f32",
-            candle_metal_kernels::Conv2dGroupedCfg {
-                b_size: params.b_size,
-                groups: params.groups,
-                c_in_pg: params.c_in,
-                c_out_pg: params.c_out,
-                h_in: params.i_h,
-                w_in: params.i_w,
-                h_out,
-                w_out,
-                k_h: params.k_h,
-                k_w: params.k_w,
-                stride: params.stride,
-                padding: params.padding,
-                dilation: params.dilation,
-            },
+            cfg,
             buffer_o(&self.buffer, layout, self.dtype),
             buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
             &buffer,

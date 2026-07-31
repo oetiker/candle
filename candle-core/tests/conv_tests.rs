@@ -1006,6 +1006,8 @@ fn conv2d_grouped(dev: &Device) -> Result<()> {
         (1, 2, 8, 8, 9, 9, 5, 5, 2, 1, 1),     // 5x5
         (2, 2, 4, 4, 8, 8, 3, 3, 0, 2, 2),     // stride 2 AND dilation 2
         (1, 3, 2, 6, 7, 5, 3, 3, 1, 1, 1),     // c_in_pg != c_out_pg
+        (2, 3, 4, 4, 7, 9, 3, 5, 1, 1, 1),     // non-square kernel: k_h != k_w
+        (2, 3, 4, 4, 7, 9, 5, 3, 2, 1, 1),     // the transpose: covers the other axis-swap
     ];
     for (i, &(b, groups, c_in_g, c_out_g, h, w, k_h, k_w, padding, stride, dilation)) in
         cases.iter().enumerate()
