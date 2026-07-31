@@ -1006,6 +1006,11 @@ fn conv2d_grouped(dev: &Device) -> Result<()> {
         (1, 2, 8, 8, 9, 9, 5, 5, 2, 1, 1),     // 5x5
         (2, 2, 4, 4, 8, 8, 3, 3, 0, 2, 2),     // stride 2 AND dilation 2
         (1, 3, 2, 6, 7, 5, 3, 3, 1, 1, 1),     // c_in_pg != c_out_pg
+        // These two are the ONLY cases with k_h != k_w. They are load-bearing: a bug that uses
+        // k_h where k_w belongs (or vice versa) in the weight index is a silent no-op whenever
+        // k_h == k_w, so every case above it would still pass. Verified (fix round 2) that
+        // sabotaging `ky * k_w + kx` to `ky * k_h + kx` leaves all square cases green and fails
+        // exactly these two.
         (2, 3, 4, 4, 7, 9, 3, 5, 1, 1, 1),     // non-square kernel: k_h != k_w
         (2, 3, 4, 4, 7, 9, 5, 3, 2, 1, 1),     // the transpose: covers the other axis-swap
     ];
