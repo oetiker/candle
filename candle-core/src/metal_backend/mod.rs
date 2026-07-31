@@ -1268,7 +1268,11 @@ impl BackendStorage for MetalStorage {
         // beats the simple kernel by amortising the weight slab over a tile of positions: measured
         // at ReDimNet-b6's six shapes it runs at ~1750 GFLOP/s against im2col+GEMM's ~530 and the
         // simple kernel's ~140, i.e. 3.2x the im2col path it replaces. Anything outside the
-        // restricted case falls through to the simple kernel below.
+        // restricted case falls through to im2col unchanged: the simple kernel measured 3.7x
+        // *slower* than im2col at every shape tried, so routing non-conforming shapes to it would
+        // make this backend a regression rather than a win. The simple kernel and its shader stay
+        // in the tree (a later review may still find a shape where it helps), but the hook no
+        // longer reaches it by default.
         const TILED: candle_metal_kernels::Conv2dGroupedTiledVariant =
             candle_metal_kernels::Conv2dGroupedTiledVariant {
                 name: "conv2d_grouped_tiled_f32_t224_c4_r8x4",
@@ -1284,6 +1288,10 @@ impl BackendStorage for MetalStorage {
             && params.c_out == 32
             && params.c_in % TILED.ci_chunk == 0;
 
+        if !tiled {
+            return Ok(None);
+        }
+
         let buffer = self
             .device
             .new_buffer_builder()
@@ -1292,31 +1300,17 @@ impl BackendStorage for MetalStorage {
             .build()?;
 
         let encoder = self.device.command_encoder()?;
-        if tiled {
-            candle_metal_kernels::call_conv2d_grouped_tiled(
-                &self.device.device,
-                &encoder,
-                &self.device.kernels,
-                TILED,
-                cfg,
-                buffer_o(&self.buffer, layout, self.dtype),
-                buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
-                &buffer,
-            )
-            .map_err(MetalError::from)?;
-        } else {
-            candle_metal_kernels::call_conv2d_grouped_direct(
-                &self.device.device,
-                &encoder,
-                &self.device.kernels,
-                "conv2d_grouped_direct_f32",
-                cfg,
-                buffer_o(&self.buffer, layout, self.dtype),
-                buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
-                &buffer,
-            )
-            .map_err(MetalError::from)?;
-        }
+        candle_metal_kernels::call_conv2d_grouped_tiled(
+            &self.device.device,
+            &encoder,
+            &self.device.kernels,
+            TILED,
+            cfg,
+            buffer_o(&self.buffer, layout, self.dtype),
+            buffer_o(&kernel.buffer, kernel_l, kernel.dtype),
+            &buffer,
+        )
+        .map_err(MetalError::from)?;
         Ok(Some(Self::new(
             buffer,
             self.device.clone(),
