@@ -973,13 +973,7 @@ CONVT2D_OP(bfloat, float, conv_transpose2d_bf16)
 
 CONV2D_GROUPED_DIRECT_OP(float, conv2d_grouped_direct_f32)
 
-// Tile variants for the sweep. Threadgroup memory used is
-// (CI_CHUNK * 3 * (TILE_T + 2) + CI_CHUNK * 288) * 4 bytes, against a 32 KB limit; thread count is
-// (TILE_T / T_REG) * (32 / CO_REG), against a 1024 limit.
-CONV2D_GROUPED_TILED_OP(float, 64, 8, 8, 4, conv2d_grouped_tiled_f32_t64_c8_r8x4)
-CONV2D_GROUPED_TILED_OP(float, 64, 16, 8, 4, conv2d_grouped_tiled_f32_t64_c16_r8x4)
-CONV2D_GROUPED_TILED_OP(float, 128, 8, 8, 4, conv2d_grouped_tiled_f32_t128_c8_r8x4)
-CONV2D_GROUPED_TILED_OP(float, 128, 8, 4, 8, conv2d_grouped_tiled_f32_t128_c8_r4x8)
-CONV2D_GROUPED_TILED_OP(float, 128, 8, 8, 8, conv2d_grouped_tiled_f32_t128_c8_r8x8)
-CONV2D_GROUPED_TILED_OP(float, 256, 4, 8, 4, conv2d_grouped_tiled_f32_t256_c4_r8x4)
-CONV2D_GROUPED_TILED_OP(float, 256, 4, 8, 8, conv2d_grouped_tiled_f32_t256_c4_r8x8)
+// One instantiation: `t224_c4_r8x4` won at all six of the model's shapes in the sweep (see the
+// task-6 report). Threadgroup memory is (4 * 3 * 226 + 4 * 288) * 4 = 15.4 KB against a 32 KB
+// limit, and the threadgroup is 224 threads against a 1024 limit.
+CONV2D_GROUPED_TILED_OP(float, 224, 4, 8, 4, conv2d_grouped_tiled_f32_t224_c4_r8x4)

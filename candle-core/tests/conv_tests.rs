@@ -1173,10 +1173,10 @@ fn conv2d_grouped_tiled_matches(dev: &Device) -> Result<()> {
         (2, 2, 32, 32, 5, 13),  // narrower than one tile
         (1, 3, 32, 32, 4, 130), // wider than one tile, and not a multiple of it
         (2, 2, 8, 32, 7, 9),    // c_in_pg != c_out_pg, still a multiple of CI_CHUNK
-        (1, 2, 32, 32, 3, 128), // exactly one tile wide
-        (2, 3, 24, 32, 5, 200), // c_in_pg a multiple of 8 but not of 32
+        (1, 2, 32, 32, 3, 224), // exactly one tile wide
+        (2, 3, 20, 32, 5, 200), // c_in_pg a multiple of CI_CHUNK but not of 32
         (1, 2, 32, 16, 6, 70),  // c_out_pg != 32: the simple kernel, same oracle
-        (1, 2, 12, 32, 4, 40),  // c_in_pg not a multiple of 8: the simple kernel again
+        (1, 2, 6, 32, 4, 40),   // c_in_pg not a multiple of CI_CHUNK: the simple kernel again
     ];
     for (i, &(b, groups, c_in_pg, c_out_pg, h, w)) in cases.iter().enumerate() {
         let c_in = c_in_pg * groups;
