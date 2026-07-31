@@ -470,8 +470,8 @@ impl Storage {
         kernel_l: &Layout,
         params: &crate::conv::ParamsConv2D,
     ) -> Result<Option<Self>> {
-        self.same_device(kernel, "conv2d")?;
-        self.same_dtype(kernel, "conv2d")?;
+        self.same_device(kernel, "conv2d_grouped")?;
+        self.same_dtype(kernel, "conv2d_grouped")?;
         match (self, &kernel) {
             (Storage::Cpu(inp), Storage::Cpu(kernel)) => {
                 Ok(inp.conv2d_grouped(l, kernel, kernel_l, params)?.map(Self::Cpu))

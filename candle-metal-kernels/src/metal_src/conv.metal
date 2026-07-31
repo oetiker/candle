@@ -650,125 +650,23 @@ kernel void FN_NAME(  \
   conv_transpose2d<TYPENAME, TYPEACC>(w_out, h_out, stride, padding, out_padding, dilation, input_dims, input_stride, k_dims, k_stride, src, k, dst, tid); \
 } \
 
-template <typename T>
-METAL_FUNC void conv2d_grouped_direct(
-    constant size_t &dst_numel,
-    constant size_t &groups,
-    constant size_t &c_in_pg,
-    constant size_t &c_out_pg,
-    constant size_t &h_in,
-    constant size_t &w_in,
-    constant size_t &h_out,
-    constant size_t &w_out,
-    constant size_t &k_h,
-    constant size_t &k_w,
-    constant size_t &stride,
-    constant size_t &padding,
-    constant size_t &dilation,
-    device const T *src,
-    device const T *weight,
-    device T *dst,
-    uint tid [[ thread_position_in_grid ]]
-) {
-  // src:    (b, groups * c_in_pg, h_in, w_in), contiguous
-  // weight: (groups * c_out_pg, c_in_pg, k_h, k_w), contiguous
-  // dst:    (b, groups * c_out_pg, h_out, w_out), contiguous
-  //
-  // One thread per OUTPUT ELEMENT. Adjacent threads differ in the width index, so both the source
-  // reads and the destination write are coalesced, and every thread in a threadgroup shares the
-  // same weights, which the cache broadcasts. im2col is never materialised: the gather is the
-  // indexing below.
-  if (tid >= dst_numel) {
-    return;
-  }
-  // 32-bit decode. `tid` is a `uint` so no destination index can exceed it, and 64-bit integer
-  // division is emulated in software on this GPU -- the same defect that cost 4.3x in im2col.
-  const uint w_out_u = uint(w_out);
-  const uint h_out_u = uint(h_out);
-  const uint c_out_pg_u = uint(c_out_pg);
-  const uint c_in_pg_u = uint(c_in_pg);
-  const uint c_out_u = c_out_pg_u * uint(groups);
-
-  uint rest = tid;
-  const uint x_idx = rest % w_out_u;
-  rest /= w_out_u;
-  const uint y_idx = rest % h_out_u;
-  rest /= h_out_u;
-  const uint co = rest % c_out_u;
-  const uint b_idx = rest / c_out_u;
-  const uint g = co / c_out_pg_u;
-
-  const size_t plane = h_in * w_in;
-  const size_t src_base =
-    (size_t)b_idx * (size_t)(c_in_pg_u * uint(groups)) * plane + (size_t)(g * c_in_pg_u) * plane;
-  const size_t w_base = (size_t)co * c_in_pg * k_h * k_w;
-
-  // Accumulate in float even for narrower T: the summation order already differs from the
-  // im2col+GEMM path, so there is no reason to also lose precision to the accumulator.
-  float acc = 0.0f;
-  for (uint ci = 0; ci < c_in_pg_u; ++ci) {
-    const size_t src_c = src_base + (size_t)ci * plane;
-    const size_t w_c = w_base + (size_t)ci * k_h * k_w;
-    for (uint ky = 0; ky < uint(k_h); ++ky) {
-      const long iy = (long)y_idx * (long)stride + (long)ky * (long)dilation - (long)padding;
-      if (iy < 0 || iy >= (long)h_in) {
-        continue;
-      }
-      for (uint kx = 0; kx < uint(k_w); ++kx) {
-        const long ix = (long)x_idx * (long)stride + (long)kx * (long)dilation - (long)padding;
-        if (ix < 0 || ix >= (long)w_in) {
-          continue;
-        }
-        acc += float(src[src_c + (size_t)iy * w_in + (size_t)ix])
-             * float(weight[w_c + (size_t)ky * k_w + (size_t)kx]);
-      }
-    }
-  }
-  dst[tid] = static_cast<T>(acc);
-}
-
-#define CONV2D_GROUPED_DIRECT_OP(T, FN_NAME) \
-kernel void FN_NAME( \
-    constant size_t &dst_numel, \
-    constant size_t &groups, \
-    constant size_t &c_in_pg, \
-    constant size_t &c_out_pg, \
-    constant size_t &h_in, \
-    constant size_t &w_in, \
-    constant size_t &h_out, \
-    constant size_t &w_out, \
-    constant size_t &k_h, \
-    constant size_t &k_w, \
-    constant size_t &stride, \
-    constant size_t &padding, \
-    constant size_t &dilation, \
-    device const T *src, \
-    device const T *weight, \
-    device T *dst, \
-    uint tid [[ thread_position_in_grid ]] \
-) { \
-  conv2d_grouped_direct<T>(dst_numel, groups, c_in_pg, c_out_pg, h_in, w_in, h_out, w_out, \
-                           k_h, k_w, stride, padding, dilation, src, weight, dst, tid); \
-} \
-
 // Implicit GEMM: out[c_out_pg, P] = W[c_out_pg, c_in_pg * 9] x Xcol[.., P], where Xcol is gathered
 // into threadgroup memory and NEVER written to device memory. One threadgroup per
 // (batch * group, output row, tile of TILE_T output columns).
 //
 // Restricted, by the dispatch predicate, to: stride 1, dilation 1, k_h == k_w == 3, padding 1,
-// c_out_pg == 32, c_in_pg a multiple of CI_CHUNK. Anything else uses the simple kernel.
+// c_out_pg == 32, c_in_pg a multiple of CI_CHUNK. Anything else falls back to im2col+GEMM.
 //
 // Where the reuse comes from. Each thread owns a REGISTER TILE of CO_REG output channels by T_REG
 // output columns. For every (input channel, ky, kx) it loads CO_REG weights and T_REG activations
 // out of threadgroup memory and issues CO_REG * T_REG fused multiply-adds against them, so the
 // ratio of arithmetic to threadgroup traffic is CO_REG * T_REG / (CO_REG + T_REG) -- 2.67 at the
-// shipped 8x4, against 0.8 for a kernel that gives each thread a single output column and keeps no
-// register tile across columns at all. The weight slab is read from device memory once per
-// threadgroup instead of once per output element, which is what the simple one-thread-per-output
-// kernel does.
+// shipped 8x4, against 0.8 for a hypothetical kernel that gives each thread a single output column
+// and keeps no register tile across columns at all (that one-thread-per-output-element design was
+// tried, measured 3.3-3.7x slower than im2col+GEMM at every shape, and was removed from the tree).
 //
 // 8x4 is not a compromise but a measured ceiling: CO_REG * T_REG == 64 live accumulators spill and
-// run SLOWER than the simple kernel, so raising the ratio past 2.67 by widening the tile loses.
+// run slower, so raising the ratio past 2.67 by widening the tile loses.
 //
 // The T_REG columns a thread owns are INTERLEAVED (column t_blk + j * NT, not t_blk * T_REG + j) so
 // that lane-adjacent threads touch adjacent threadgroup words and adjacent destination addresses.
@@ -978,8 +876,6 @@ CONVT2D_OP(half, float, conv_transpose2d_f16)
 #if defined(__HAVE_BFLOAT__)
 CONVT2D_OP(bfloat, float, conv_transpose2d_bf16)
 #endif
-
-CONV2D_GROUPED_DIRECT_OP(float, conv2d_grouped_direct_f32)
 
 // One instantiation: `t224_c4_r8x4` won at all six of the model's shapes in the sweep (see the
 // task-6 report). Threadgroup memory is (4 * 3 * 226 + 4 * 288) * 4 = 15.4 KB against a 32 KB

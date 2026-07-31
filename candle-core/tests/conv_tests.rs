@@ -1164,8 +1164,13 @@ test_device!(
 /// never reaches the grouped hook at all (see `conv.rs`), so it goes through im2col plus GEMM while
 /// the fused call goes through the tiled shader. A shared misreading of the layout therefore cannot
 /// hide here. The tiled variant is selected by the backend predicate (3x3, stride 1, padding 1,
-/// 32 out-channels per group), so `c_out_pg == 32` exercises it and 16 exercises the simple kernel,
-/// which is the second independent implementation of the same thing.
+/// 32 out-channels per group), so `c_out_pg == 32` exercises it. The predicate-miss cases below
+/// (`c_out_pg != 32`, or `c_in_pg` not a multiple of `CI_CHUNK`) exercise candle's unchanged
+/// im2col+GEMM fallback on BOTH sides of the comparison -- the fused call declines the tiled path
+/// and falls through to the same im2col code the per-group reference uses. They are not an
+/// independent cross-check in those rows; they are routing-regression coverage, verifying that a
+/// predicate miss still produces a correct result via the fallback rather than, say, silently
+/// dropping to a wrong shape or erroring.
 ///
 /// At least one case MUST be wider than `TILE_T` (224). The grid is `w_out.div_ceil(TILE_T)`
 /// threadgroups across, so a suite of narrow cases only ever runs `tgid.x == 0`, which makes `x0`
@@ -1184,8 +1189,8 @@ fn conv2d_grouped_tiled_matches(dev: &Device) -> Result<()> {
         (1, 2, 32, 32, 3, 500), // THREE tiles, the last partial: exercises x0 != 0
         (1, 2, 32, 32, 3, 448), // exactly two tiles: multi-tile with no partial tile
         (2, 3, 20, 32, 5, 200), // c_in_pg a multiple of CI_CHUNK but not of 32
-        (1, 2, 32, 16, 6, 70),  // c_out_pg != 32: the simple kernel, same oracle
-        (1, 2, 6, 32, 4, 40),   // c_in_pg not a multiple of CI_CHUNK: the simple kernel again
+        (1, 2, 32, 16, 6, 70),  // c_out_pg != 32: predicate miss, both sides run im2col
+        (1, 2, 6, 32, 4, 40),   // c_in_pg not a multiple of CI_CHUNK: predicate miss again
     ];
     for (i, &(b, groups, c_in_pg, c_out_pg, h, w)) in cases.iter().enumerate() {
         let c_in = c_in_pg * groups;

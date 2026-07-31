@@ -1250,43 +1250,36 @@ impl BackendStorage for MetalStorage {
             padding: params.padding,
             dilation: params.dilation,
         };
-        // `cfg.dst_el()` is the single source of truth shared with `call_conv2d_grouped_direct`
-        // (see its doc comment), so this check and the buffer allocation below can never
-        // disagree with what the shader actually dispatches.
+        // `cfg.dst_el()` is the single source of truth shared with `call_conv2d_grouped_tiled`
+        // (see its doc comment), so the buffer allocation below can never disagree with what the
+        // shader actually dispatches.
         //
-        // The shader decodes `thread_position_in_grid` (a `uint`) into (b, co, y, x) with 32-bit
-        // arithmetic for speed -- 64-bit division is emulated in software on this GPU. That
-        // decode silently wraps once `dst_el` exceeds `u32::MAX`, so decline here and fall back
-        // to the always-correct im2col path rather than dispatch a kernel that would compute
-        // wrapped indices past that ceiling.
+        // No 32-bit-overflow guard is needed here: unlike the one-thread-per-output-element
+        // design that used to live at this call site (removed -- it decoded a linear `uint`
+        // `thread_position_in_grid` and would have wrapped past `u32::MAX` output elements), the
+        // tiled shader below computes every source/destination index from `tgid`/`tix` in
+        // `size_t` and never forms a linear 32-bit output index at all. Its own overflow surface
+        // is the Metal dispatch geometry (`MTLSize` grid/group dimensions, themselves `usize` on
+        // the Rust side / `NSUInteger` on the Metal side), which is unrelated to `dst_el` and not
+        // a concern at any shape this backend runs.
         let dst_el = cfg.dst_el();
-        if u32::try_from(dst_el).is_err() {
-            return Ok(None);
-        }
         // The tiled kernel handles only the restricted 3x3 / stride-1 / pad-1 case with 32 output
-        // channels per group -- which is every grouped convolution in the residual blocks. It
-        // beats the simple kernel by amortising the weight slab over a tile of positions: measured
-        // at ReDimNet-b6's six shapes it runs at ~1750 GFLOP/s against im2col+GEMM's ~530 and the
-        // simple kernel's ~140, i.e. 3.2x the im2col path it replaces. Anything outside the
-        // restricted case falls through to im2col unchanged: the simple kernel measured 3.7x
-        // *slower* than im2col at every shape tried, so routing non-conforming shapes to it would
-        // make this backend a regression rather than a win. The simple kernel and its shader stay
-        // in the tree (a later review may still find a shape where it helps), but the hook no
-        // longer reaches it by default.
+        // channels per group -- which is every grouped convolution in the residual blocks. It was
+        // measured at ReDimNet-b6's six shapes to run at ~1750 GFLOP/s against im2col+GEMM's ~530,
+        // i.e. 3.2x the im2col path it replaces. Anything outside the restricted case falls
+        // through to im2col unchanged: a one-thread-per-output-element "simple" kernel was tried
+        // for that fallback case, measured 3.3-3.7x *slower* than im2col at every shape tried, and
+        // was removed from the tree (retrievable at candle commit `daba099`) rather than kept
+        // as dead code that nothing would ever call.
         const TILED: candle_metal_kernels::Conv2dGroupedTiledVariant =
-            candle_metal_kernels::Conv2dGroupedTiledVariant {
-                name: "conv2d_grouped_tiled_f32_t224_c4_r8x4",
-                tile_t: 224,
-                ci_chunk: 4,
-                threads: 224,
-            };
+            candle_metal_kernels::Conv2dGroupedTiledVariant::T224_C4_R8X4;
         let tiled = params.k_h == 3
             && params.k_w == 3
             && params.stride == 1
             && params.padding == 1
             && params.dilation == 1
             && params.c_out == 32
-            && params.c_in % TILED.ci_chunk == 0;
+            && params.c_in % TILED.ci_chunk() == 0;
 
         if !tiled {
             return Ok(None);
@@ -1296,7 +1289,7 @@ impl BackendStorage for MetalStorage {
             .device
             .new_buffer_builder()
             .with_size_for(dst_el, self.dtype)
-            .with_label("conv2d_grouped_direct")
+            .with_label("conv2d_grouped_tiled")
             .build()?;
 
         let encoder = self.device.command_encoder()?;

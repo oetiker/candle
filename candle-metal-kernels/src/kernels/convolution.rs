@@ -313,7 +313,7 @@ pub fn call_conv_transpose1d(
     Ok(())
 }
 
-/// Everything `call_conv2d_grouped_direct` needs that is not a buffer. Grouped: the input has
+/// Everything `call_conv2d_grouped_tiled` needs that is not a buffer. Grouped: the input has
 /// `groups * c_in_pg` channels and the output `groups * c_out_pg`.
 #[derive(Debug, Clone, Copy)]
 pub struct Conv2dGroupedCfg {
@@ -335,59 +335,11 @@ pub struct Conv2dGroupedCfg {
 impl Conv2dGroupedCfg {
     /// The number of output elements: `b * groups * c_out_pg * h_out * w_out`. The single
     /// source of truth for this product — the caller (`MetalStorage::conv2d_grouped`) uses it
-    /// both to size the output buffer and to decide whether the shader's `uint`-based (32-bit)
-    /// destination decode can represent every index without wrapping, so it must never drift
-    /// from what this function actually dispatches.
+    /// to size the output buffer, so it must never drift from what the tiled kernel actually
+    /// dispatches.
     pub fn dst_el(&self) -> usize {
         self.b_size * self.groups * self.c_out_pg * self.h_out * self.w_out
     }
-}
-
-/// A grouped 2-D convolution computed directly, without materialising im2col.
-///
-/// One thread per output element. The caller guarantees contiguous `input` and `weight`.
-#[allow(clippy::too_many_arguments)]
-pub fn call_conv2d_grouped_direct(
-    device: &Device,
-    ep: impl EncoderProvider,
-    kernels: &Kernels,
-    name: &'static str,
-    cfg: Conv2dGroupedCfg,
-    input: BufferOffset,
-    weight: BufferOffset,
-    output: &Buffer,
-) -> Result<(), MetalKernelError> {
-    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
-    let dst_el = cfg.dst_el();
-
-    let encoder = ep.encoder();
-    let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
-    encoder.set_compute_pipeline_state(&pipeline);
-    debug_group!(encoder, "conv2d_grouped_direct {name} dst_el={dst_el}");
-    set_params!(
-        encoder,
-        (
-            dst_el,
-            cfg.groups,
-            cfg.c_in_pg,
-            cfg.c_out_pg,
-            cfg.h_in,
-            cfg.w_in,
-            cfg.h_out,
-            cfg.w_out,
-            cfg.k_h,
-            cfg.k_w,
-            cfg.stride,
-            cfg.padding,
-            cfg.dilation,
-            &input,
-            &weight,
-            Output::new(output)
-        )
-    );
-    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
-    Ok(())
 }
 
 /// One instantiated `conv2d_grouped_tiled` pipeline: its entry point plus the tile constants the
@@ -397,13 +349,33 @@ pub fn call_conv2d_grouped_direct(
 #[derive(Debug, Clone, Copy)]
 pub struct Conv2dGroupedTiledVariant {
     /// Shader entry point, e.g. `conv2d_grouped_tiled_f32_t224_c4_r8x4`.
-    pub name: &'static str,
+    name: &'static str,
     /// `TILE_T`: output columns per threadgroup.
-    pub tile_t: usize,
+    tile_t: usize,
     /// `CI_CHUNK`: input channels staged per pass. `c_in_pg` must be a multiple of it.
-    pub ci_chunk: usize,
+    ci_chunk: usize,
     /// `(TILE_T / T_REG) * (32 / CO_REG)`: threads per threadgroup.
-    pub threads: usize,
+    threads: usize,
+}
+
+impl Conv2dGroupedTiledVariant {
+    /// The one shader instantiated in `conv.metal`: `conv2d_grouped_tiled<float, 224, 4, 8, 4>`.
+    /// Fields are private and only reachable through this named constant (or others like it, were
+    /// more instantiated) so the geometry quoted to `call_conv2d_grouped_tiled` can never drift
+    /// from what the shader was actually compiled with -- a mismatched `tile_t` would silently
+    /// compute the wrong columns, per the module doc comment above.
+    pub const T224_C4_R8X4: Self = Self {
+        name: "conv2d_grouped_tiled_f32_t224_c4_r8x4",
+        tile_t: 224,
+        ci_chunk: 4,
+        threads: 224,
+    };
+
+    /// `CI_CHUNK`: input channels staged per pass. Callers use this to check `c_in_pg % ci_chunk
+    /// == 0` before dispatching.
+    pub const fn ci_chunk(&self) -> usize {
+        self.ci_chunk
+    }
 }
 
 /// The tiled grouped conv2d. Only valid for the restricted case the shader documents:

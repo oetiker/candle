@@ -325,6 +325,9 @@ impl Tensor {
                 "in_channel mismatch between input ({c_in}, groups {groups}) and kernel ({c_in_k})"
             )
         }
+        if c_out % groups != 0 {
+            crate::bail!("out_channel {c_out} is not divisible by groups {groups}")
+        }
         let params = ParamsConv2D {
             b_size,
             i_h,
