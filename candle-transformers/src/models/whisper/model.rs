@@ -193,7 +193,7 @@ impl ResidualAttentionBlock {
             &self
                 .mlp_linear1
                 .forward(&self.mlp_ln.forward(&x)?)?
-                .gelu()?,
+                .gelu_erf()?,
         )?;
         x + mlp
     }
@@ -282,11 +282,16 @@ impl AudioEncoder {
         let _enter = self.span.enter();
         let x = {
             let _enter = self.conv1_span.enter();
-            self.conv1.forward(x)?.gelu()?
+            // GELU is the EXACT (erf) form here, not candle's tanh approximation: OpenAI's
+            // whisper uses `nn.GELU()`, which is erf-based, and so does the mlx port. The
+            // approximation differs by up to ~1e-3 per activation, which compounds through
+            // 32 encoder layers to a max absolute error of ~7 in the encoder output --
+            // measured against mlx_whisper on whisper-large-v3 at f32.
+            self.conv1.forward(x)?.gelu_erf()?
         };
         let x = {
             let _enter = self.conv2_span.enter();
-            self.conv2.forward(&x)?.gelu()?
+            self.conv2.forward(&x)?.gelu_erf()?
         };
         let x = x.transpose(1, 2)?;
         let (_bsize, seq_len, _hidden) = x.dims3()?;
