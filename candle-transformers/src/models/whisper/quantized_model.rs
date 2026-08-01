@@ -255,6 +255,11 @@ impl AudioEncoder {
         };
         let conv1 = conv1d(cfg.num_mel_bins, n_state, 3, cfg1, vb.pp("conv1"))?;
         let conv2 = conv1d(n_state, n_state, 3, cfg2, vb.pp("conv2"))?;
+        // NOT given the f16 dtype cast its unquantized twin in model.rs received. That fix
+        // exists to let the model be LOADED at f16 via VarBuilder::dtype; the quantized
+        // path dequantizes to a dtype fixed by the gguf file and has no VarBuilder dtype to
+        // follow, so the cast would have nothing correct to read. The GELU fix applies to
+        // both because that one is about which function Whisper uses, not about dtype.
         let positional_embedding = sinusoids(n_ctx, n_state, vb.device())?;
         let blocks = (0..cfg.encoder_layers)
             .map(|i| {
