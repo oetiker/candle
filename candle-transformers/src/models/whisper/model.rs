@@ -259,7 +259,11 @@ impl AudioEncoder {
         };
         let conv1 = conv1d(cfg.num_mel_bins, n_state, 3, cfg1, vb.pp("conv1"))?;
         let conv2 = conv1d(n_state, n_state, 3, cfg2, vb.pp("conv2"))?;
-        let positional_embedding = sinusoids(n_ctx, n_state, vb.device())?;
+        // Cast to the VarBuilder's dtype. `sinusoids` builds in f32 unconditionally, and
+        // the encoder adds this straight onto the conv stack's output -- so at f16 the
+        // forward pass died with "dtype mismatch in add, lhs: F16, rhs: F32" and the model
+        // could not run in half precision at all.
+        let positional_embedding = sinusoids(n_ctx, n_state, vb.device())?.to_dtype(vb.dtype())?;
         let blocks = (0..cfg.encoder_layers)
             .map(|i| {
                 ResidualAttentionBlock::load(n_state, n_head, false, vb.pp(format!("layers.{i}")))
@@ -335,7 +339,9 @@ impl TextDecoder {
         let mask: Vec<_> = (0..n_ctx)
             .flat_map(|i| (0..n_ctx).map(move |j| if j > i { f32::NEG_INFINITY } else { 0f32 }))
             .collect();
-        let mask = Tensor::from_vec(mask, (n_ctx, n_ctx), vb.device())?;
+        // Same reason as the encoder's positional embedding: this mask is broadcast-added
+        // onto the attention logits, so it has to share their dtype.
+        let mask = Tensor::from_vec(mask, (n_ctx, n_ctx), vb.device())?.to_dtype(vb.dtype())?;
         Ok(Self {
             token_embedding,
             positional_embedding,
