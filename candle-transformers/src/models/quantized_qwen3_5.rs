@@ -117,7 +117,7 @@ pub fn read_expert_quants_per_layer<P: AsRef<std::path::Path>>(
     let mut file = std::fs::File::open(path.as_ref())?;
     let ct = gguf_file::Content::read(&mut file)?;
     let arch = match ct.metadata.get("general.architecture") {
-        Some(v) => v.to_string()?.clone(),
+        Some(v) => v.to_string()?,
         None => candle::bail!("cannot find general.architecture in metadata"),
     };
     let md_get = |s: &str| {
@@ -198,7 +198,7 @@ fn split_stacked_experts(t: &QTensor, device: &Device) -> Result<Vec<QMatMul>> {
 /// `norm_topk_prob` from the presence of a shared expert, which would yield `false` for this
 /// checkpoint and be wrong.
 #[derive(Debug, Clone)]
-struct MoeWeights {
+pub struct MoeWeights {
     /// `[n_experts, hidden]`, f32. Kept dense: it is F32 in the GGUF and tiny.
     router: Tensor,
     gate_experts: Vec<QMatMul>,
@@ -273,7 +273,7 @@ impl MoeWeights {
 
     /// The quant types this layer's routed-expert tensors were actually read as -- not layer 0's,
     /// not a checkpoint-wide assumption. See [`ExpertQuants`].
-    fn expert_quants(&self) -> ExpertQuants {
+    pub fn expert_quants(&self) -> ExpertQuants {
         self.expert_quants
     }
 
@@ -1156,7 +1156,8 @@ mod tests {
         if !path.exists() {
             panic!("35B GGUF required for this test: {}", path.display());
         }
-        let quants = read_expert_quants_per_layer(path).unwrap();
+        let quants =
+            read_expert_quants_per_layer(path).expect("failed to read expert quant types from the 35B GGUF");
         assert_eq!(quants.len(), 40);
 
         let downs: std::collections::HashSet<_> = quants.iter().map(|q| q.down).collect();
@@ -1168,5 +1169,29 @@ mod tests {
         assert_eq!(quants.iter().filter(|q| q.down == GgmlDType::Q6K).count(), 3);
         assert_eq!(quants.iter().filter(|q| q.down == GgmlDType::Q5K).count(), 37);
         assert!(quants.iter().all(|q| q.gate == GgmlDType::Q4K && q.up == GgmlDType::Q4K));
+
+        // Assert layer IDENTITY, not just the multiset. A loader that reads the correct set of
+        // types but assigns them to the wrong layer indices (an off-by-one in the loop, a
+        // shuffle) would still pass every assertion above -- Tasks 3/4/12 dispatch a Metal kernel
+        // PER LAYER using exactly this value, so a misattribution bug must be caught here.
+        //
+        // Ground truth independently verified with llama.cpp's own gguf-py reader (NOT this
+        // crate's gguf parser, so this isn't circular):
+        //   PYTHONPATH=llama.cpp/gguf-py python3 -c
+        //     'import gguf; r = gguf.GGUFReader("...35B.gguf"); ...'
+        //   -> Q6_K on blk.{34,38,39}.ffn_down_exps.weight, Q5_K on all other 37 layers.
+        let q6_layers: Vec<usize> = quants
+            .iter()
+            .enumerate()
+            .filter(|(_, q)| q.down == GgmlDType::Q6K)
+            .map(|(i, _)| i)
+            .collect();
+        assert_eq!(
+            q6_layers,
+            vec![34, 38, 39],
+            "Q6_K ffn_down_exps must land on exactly layers 34, 38, 39 -- got {q6_layers:?}; a \
+             correct multiset at the wrong layer indices is exactly the misattribution bug this \
+             test exists to catch"
+        );
     }
 }
