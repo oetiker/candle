@@ -9,9 +9,10 @@
 use super::with_tracing::QMatMul;
 use crate::models::qwen3_5_linear_attn_scan::{gated_delta_rule_chunked, sequential_step};
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
-use candle::quantized::{gguf_file, QTensor};
+use candle::quantized::{gguf_file, QStorage, QTensor};
 use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{kv_cache::ConcatKvCache, Activation, Embedding};
+use std::borrow::Cow;
 use std::io::{Read, Seek};
 use std::sync::Arc;
 
@@ -75,6 +76,197 @@ impl Module for MlpWeights {
         let up = self.up_proj.forward(x)?;
         let gated = (gate * up)?;
         self.down_proj.forward(&gated)
+    }
+}
+
+/// Split a 3D stacked expert tensor `[n_experts, n_out, n_in]` into one `QMatMul` per expert.
+///
+/// candle's quantized MoE path is CUDA-only: `candle_nn::moe::moe_gemm_gguf` bails on every other
+/// backend, and it works by handing `QTensor::device_ptr()` to a C kernel -- a method that itself
+/// bails for Metal and CPU. So there is no way to matmul against a 3D quantized stack here.
+///
+/// Each expert occupies a contiguous byte range (verified against the checkpoint: `ffn_gate_exps`
+/// is 150994944 bytes for 256 experts, and 512*2048/256 blocks * 144 bytes = 589824 per expert), so
+/// the stack can be carved into 2D `[n_out, n_in]` tensors at load time with no dequantization and
+/// no change in total memory. This trades one fused kernel for `n_experts` small matmuls; it is a
+/// correctness-first implementation, not a fast one.
+fn split_stacked_experts(t: &QTensor, device: &Device) -> Result<Vec<QMatMul>> {
+    let (n_experts, n_out, n_in) = t.shape().dims3()?;
+    let dtype = t.dtype();
+    let data = t.data()?;
+    let per_expert = data.len() / n_experts;
+    if per_expert * n_experts != data.len() {
+        candle::bail!(
+            "expert stack {:?} of {} bytes does not divide evenly into {n_experts} experts",
+            t.shape().dims(),
+            data.len()
+        )
+    }
+    let mut out = Vec::with_capacity(n_experts);
+    for e in 0..n_experts {
+        let bytes = &data[e * per_expert..(e + 1) * per_expert];
+        let storage = QStorage::from_data(Cow::Borrowed(bytes), device, dtype)?;
+        let qt = QTensor::new(storage, (n_out, n_in))?;
+        out.push(QMatMul::from_weights(Arc::new(qt))?);
+    }
+    Ok(out)
+}
+
+/// Sparse MoE feed-forward with a gated shared expert.
+///
+/// Mirrors llama.cpp's `llama_model_qwen35moe::graph::build_layer_ffn`
+/// (`src/models/qwen35moe.cpp:497-545`) and `llm_graph_context::build_moe_ffn`
+/// (`src/llama-graph.cpp:1914+`), which is the reference the token-id gate compares against:
+///
+///   probs   = softmax(ffn_gate_inp @ x)          <- softmax BEFORE top-k
+///   w       = probs[top_k] / sum(probs[top_k])   <- norm_w = true, sum clamped to >= 6.1035e-5
+///   moe     = sum_j w_j * down_e(silu(gate_e(x)) * up_e(x))
+///   shexp   = down_shexp(silu(gate_shexp(x)) * up_shexp(x)) * sigmoid(ffn_gate_inp_shexp @ x)
+///   out     = moe + shexp
+///
+/// `expert_weights_scale` is deliberately absent: it defaults to 0.0 in llama.cpp's hparams,
+/// `qwen35moe.cpp` never reads it from the GGUF, and `build_moe_ffn` skips the scaling when it is
+/// 0.0 or 1.0. Note also that `norm_w` is TRUE here -- `quantized_qwen3_moe.rs` *infers*
+/// `norm_topk_prob` from the presence of a shared expert, which would yield `false` for this
+/// checkpoint and be wrong.
+#[derive(Debug, Clone)]
+struct MoeWeights {
+    /// `[n_experts, hidden]`, f32. Kept dense: it is F32 in the GGUF and tiny.
+    router: Tensor,
+    gate_experts: Vec<QMatMul>,
+    up_experts: Vec<QMatMul>,
+    down_experts: Vec<QMatMul>,
+    /// `[1, hidden]`, f32. The GGUF stores this 1-D; it produces one scalar gate per token.
+    shared_router: Tensor,
+    shared_gate: QMatMul,
+    shared_up: QMatMul,
+    shared_down: QMatMul,
+    num_experts_per_tok: usize,
+}
+
+impl MoeWeights {
+    fn new<R: Read + Seek>(
+        gg: &mut Gguf<R>,
+        prefix: &str,
+        num_experts_per_tok: usize,
+    ) -> Result<Self> {
+        let device = gg.device.clone();
+        let router = gg
+            .tensor(&format!("{prefix}.ffn_gate_inp.weight"))?
+            .dequantize(&device)?
+            .to_dtype(DType::F32)?;
+        let gate_experts =
+            split_stacked_experts(&gg.tensor(&format!("{prefix}.ffn_gate_exps.weight"))?, &device)?;
+        let up_experts =
+            split_stacked_experts(&gg.tensor(&format!("{prefix}.ffn_up_exps.weight"))?, &device)?;
+        let down_experts =
+            split_stacked_experts(&gg.tensor(&format!("{prefix}.ffn_down_exps.weight"))?, &device)?;
+
+        let shared_router = gg
+            .tensor(&format!("{prefix}.ffn_gate_inp_shexp.weight"))?
+            .dequantize(&device)?
+            .to_dtype(DType::F32)?;
+        let hidden = shared_router.elem_count();
+        let shared_router = shared_router.reshape((1, hidden))?;
+
+        let (shared_gate, _) = gg.qmatmul(&format!("{prefix}.ffn_gate_shexp.weight"))?;
+        let (shared_up, _) = gg.qmatmul(&format!("{prefix}.ffn_up_shexp.weight"))?;
+        let (shared_down, _) = gg.qmatmul(&format!("{prefix}.ffn_down_shexp.weight"))?;
+
+        Ok(Self {
+            router,
+            gate_experts,
+            up_experts,
+            down_experts,
+            shared_router,
+            shared_gate,
+            shared_up,
+            shared_down,
+            num_experts_per_tok,
+        })
+    }
+
+    fn expert_ffn(&self, e: usize, xs: &Tensor) -> Result<Tensor> {
+        let gate = candle_nn::ops::silu(&self.gate_experts[e].forward(xs)?)?;
+        let up = self.up_experts[e].forward(xs)?;
+        self.down_experts[e].forward(&(gate * up)?)
+    }
+}
+
+impl Module for MoeWeights {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, t, hidden) = x.dims3()?;
+        let original_dtype = x.dtype();
+        let xs = x.reshape(((), hidden))?.to_dtype(DType::F32)?;
+        let n_tokens = b * t;
+
+        let logits = xs.matmul(&self.router.t()?.contiguous()?)?;
+        let probs = candle_nn::ops::softmax_last_dim(&logits)?;
+
+        let k = self.num_experts_per_tok;
+        // `narrow` on an argsort is a view; the gather below needs it contiguous.
+        let topk_ids = probs
+            .arg_sort_last_dim(false)?
+            .narrow(D::Minus1, 0, k)?
+            .contiguous()?;
+        let weights = probs.gather(&topk_ids, D::Minus1)?;
+        // Clamp exactly as llama.cpp does (llama-graph.cpp:2061) so a degenerate row cannot divide
+        // by zero.
+        let denom = weights.sum_keepdim(D::Minus1)?.clamp(6.103515625e-5, f64::INFINITY)?;
+        let weights = weights.broadcast_div(&denom)?;
+
+        // Group tokens by expert so each expert runs ONE matmul over all its rows, instead of one
+        // matmul per (token, slot). Without this a 5304-token prefill would issue 42k matmuls per
+        // projection per layer. Routing is read back to host because it drives control flow.
+        let ids_host = topk_ids.flatten_all()?.to_vec1::<u32>()?;
+        let w_host = weights.flatten_all()?.to_vec1::<f32>()?;
+        let n_experts = self.gate_experts.len();
+        let mut rows: Vec<Vec<u32>> = vec![Vec::new(); n_experts];
+        let mut coefs: Vec<Vec<f32>> = vec![Vec::new(); n_experts];
+        for (slot, (&e, &w)) in ids_host.iter().zip(w_host.iter()).enumerate() {
+            let token = (slot / k) as u32;
+            rows[e as usize].push(token);
+            coefs[e as usize].push(w);
+        }
+
+        let device = xs.device();
+        let mut out = Tensor::zeros((n_tokens, hidden), DType::F32, device)?;
+        for e in 0..n_experts {
+            if rows[e].is_empty() {
+                continue;
+            }
+            let idx = Tensor::from_slice(&rows[e], rows[e].len(), device)?;
+            let xe = xs.index_select(&idx, 0)?;
+            let ye = self.expert_ffn(e, &xe)?;
+            let w = Tensor::from_slice(&coefs[e], (rows[e].len(), 1), device)?;
+            out = out.index_add(&idx, &ye.broadcast_mul(&w)?, 0)?;
+        }
+
+        // Shared expert, applied to every token and gated by its own sigmoid scalar.
+        let sh_gate = candle_nn::ops::silu(&self.shared_gate.forward(&xs)?)?;
+        let sh_up = self.shared_up.forward(&xs)?;
+        let sh = self.shared_down.forward(&(sh_gate * sh_up)?)?;
+        let sh_scale =
+            candle_nn::ops::sigmoid(&xs.matmul(&self.shared_router.t()?.contiguous()?)?)?;
+        let out = (out + sh.broadcast_mul(&sh_scale)?)?;
+
+        out.reshape((b, t, hidden))?.to_dtype(original_dtype)
+    }
+}
+
+/// Dense FFN or sparse MoE, chosen per layer from the GGUF's `expert_count`.
+#[derive(Debug, Clone)]
+enum Ffn {
+    Dense(MlpWeights),
+    Moe(MoeWeights),
+}
+
+impl Module for Ffn {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        match self {
+            Self::Dense(m) => m.forward(x),
+            Self::Moe(m) => m.forward(x),
+        }
     }
 }
 
@@ -592,7 +784,7 @@ enum TokenMixer {
 #[derive(Debug, Clone)]
 struct LayerWeights {
     token_mixer: TokenMixer,
-    mlp: MlpWeights,
+    mlp: Ffn,
     input_layernorm: RmsNorm,
     post_attention_layernorm: RmsNorm,
 }
@@ -615,6 +807,8 @@ impl LayerWeights {
         linear_value_head_dim: usize,
         linear_conv_kernel_dim: usize,
         hidden_size: usize,
+        num_experts: usize,
+        num_experts_per_tok: usize,
     ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         let is_full_attention = (layer_idx + 1).is_multiple_of(full_attention_interval);
@@ -643,7 +837,14 @@ impl LayerWeights {
             )?)
         };
 
-        let mlp = MlpWeights::new(gg, &prefix)?;
+        // Every layer is MoE when the checkpoint declares experts. llama.cpp reaches the same
+        // conclusion via `decoder_sparse_step` defaulting to 1 (qwen35moe has no such key), so the
+        // condition reduces to `expert_count > 0`. Qwen3.6-35B-A3B: 40 of 40 layers.
+        let mlp = if num_experts > 0 {
+            Ffn::Moe(MoeWeights::new(gg, &prefix, num_experts_per_tok)?)
+        } else {
+            Ffn::Dense(MlpWeights::new(gg, &prefix)?)
+        };
         let input_layernorm = gg.rms_norm(&format!("{prefix}.attn_norm.weight"), rms_norm_eps)?;
         let post_attention_layernorm = gg.rms_norm(
             &format!("{prefix}.post_attention_norm.weight"),
@@ -698,14 +899,20 @@ impl ModelWeights {
         device: &Device,
     ) -> Result<Self> {
         let mut gg = Gguf::new(ct, reader, device.clone());
-        let md_get = |s: &str| match gg.metadata().get(s) {
-            Some(v) => Ok(v),
-            None => {
-                let s35 = s.replace("qwen3.", "qwen35.");
-                match gg.metadata().get(&s35) {
-                    Some(v) => Ok(v),
-                    None => candle::bail!("cannot find {s} or {s35} in metadata"),
-                }
+        // Key prefixes come from the file's own `general.architecture`, not from a hardcoded
+        // substitution. It is `qwen35` for the dense Qwen3.5 checkpoints and `qwen35moe` for the
+        // MoE ones (Qwen3.6-35B-A3B), and the old `replace("qwen3.", "qwen35.")` could never
+        // produce the latter -- the 35B failed to load with
+        // `cannot find qwen3.attention.head_count or qwen35.attention.head_count`.
+        let arch = match gg.metadata().get("general.architecture") {
+            Some(v) => v.to_string()?.clone(),
+            None => candle::bail!("cannot find general.architecture in metadata"),
+        };
+        let md_get = |s: &str| {
+            let keyed = s.replace("qwen3.", &format!("{arch}."));
+            match gg.metadata().get(s).or_else(|| gg.metadata().get(&keyed)) {
+                Some(v) => Ok(v),
+                None => candle::bail!("cannot find {s} or {keyed} in metadata"),
             }
         };
 
@@ -733,6 +940,16 @@ impl ModelWeights {
         let linear_value_head_dim = linear_key_head_dim;
         let linear_num_value_heads = ssm_inner_size / linear_value_head_dim;
         let linear_conv_kernel_dim = md_get("qwen3.ssm.conv_kernel")?.to_u32()? as usize;
+
+        // MoE. Absent on the dense checkpoints, so both are optional and default to 0 -> dense.
+        let num_experts = md_get("qwen3.expert_count")
+            .and_then(|v| v.to_u32())
+            .map(|v| v as usize)
+            .unwrap_or(0);
+        let num_experts_per_tok = md_get("qwen3.expert_used_count")
+            .and_then(|v| v.to_u32())
+            .map(|v| v as usize)
+            .unwrap_or(0);
 
         let dtype = match gg.metadata().get("general.dtype") {
             Some(v) => match v.to_u32() {
@@ -772,6 +989,8 @@ impl ModelWeights {
                 linear_value_head_dim,
                 linear_conv_kernel_dim,
                 hidden_size,
+                num_experts,
+                num_experts_per_tok,
             )?);
         }
 
