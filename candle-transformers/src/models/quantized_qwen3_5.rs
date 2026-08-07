@@ -93,8 +93,12 @@ pub struct ExpertQuants {
 
 /// Quant types this loader knows how to handle for routed-expert weights. Anything else fails
 /// loudly at load time instead of silently mis-dequantizing.
-const SUPPORTED_EXPERT_QUANTS: [GgmlDType; 4] =
-    [GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K, GgmlDType::Q8_0];
+const SUPPORTED_EXPERT_QUANTS: [GgmlDType; 4] = [
+    GgmlDType::Q4K,
+    GgmlDType::Q5K,
+    GgmlDType::Q6K,
+    GgmlDType::Q8_0,
+];
 
 fn check_expert_quant(tensor_name: &str, dtype: GgmlDType) -> Result<GgmlDType> {
     if SUPPORTED_EXPERT_QUANTS.contains(&dtype) {
@@ -147,30 +151,81 @@ pub fn read_expert_quants_per_layer<P: AsRef<std::path::Path>>(
     Ok(out)
 }
 
+/// How the routed experts are evaluated.
+///
+/// Chosen at load time, not per call, because it decides what gets built: `Fused` needs the
+/// stacked `[n_experts, n_out, n_in]` tensor the `mul_mv_id` kernel indexes into, `Loop` needs
+/// only the per-expert 2-D matrices. Both are always available once loaded (the per-expert
+/// matrices are views into the stack, see [`split_stacked_experts`]), so the switch costs nothing
+/// but keeps `Loop` byte-for-byte the path the llama.cpp gate was closed against.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MoeMode {
+    /// Group tokens by expert on the host and issue one plain quantized matmul per non-empty
+    /// group. Correct everywhere, and the only path for prefill until Task 4's `mm_id`.
+    #[default]
+    Loop,
+    /// Decode (one token) goes through the fused `mul_mv_id` Metal kernel: no host readback of
+    /// the routing, no per-expert dispatch. Prefill still uses the loop.
+    Fused,
+}
+
+impl std::str::FromStr for MoeMode {
+    type Err = candle::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "loop" => Ok(Self::Loop),
+            "fused" => Ok(Self::Fused),
+            other => candle::bail!("unknown MoE mode {other}, expected `loop` or `fused`"),
+        }
+    }
+}
+
 /// Split a 3D stacked expert tensor `[n_experts, n_out, n_in]` into one `QMatMul` per expert.
 ///
 /// candle's quantized MoE path is CUDA-only: `candle_nn::moe::moe_gemm_gguf` bails on every other
 /// backend, and it works by handing `QTensor::device_ptr()` to a C kernel -- a method that itself
-/// bails for Metal and CPU. So there is no way to matmul against a 3D quantized stack here.
+/// bails for Metal and CPU. So on Metal a 3D quantized stack cannot be fed to a plain matmul.
 ///
 /// Each expert occupies a contiguous byte range (verified against the checkpoint: `ffn_gate_exps`
 /// is 150994944 bytes for 256 experts, and 512*2048/256 blocks * 144 bytes = 589824 per expert), so
-/// the stack can be carved into 2D `[n_out, n_in]` tensors at load time with no dequantization and
-/// no change in total memory. This trades one fused kernel for `n_experts` small matmuls; it is a
-/// correctness-first implementation, not a fast one.
+/// the stack can be carved into 2D `[n_out, n_in]` tensors at load time with no dequantization.
+///
+/// On Metal the carve is a BORROW (`QTensor::byte_view`): all `n_experts` matrices and the stack
+/// itself point into one allocation. That matters because `MoeMode::Fused` keeps the stack alive
+/// for `mul_mv_id` while still needing the per-expert matrices for prefill -- copying would put
+/// the ~20 GB of 35B expert weights in memory twice. Elsewhere (and if the byte offsets are not
+/// suitably aligned) it falls back to copying, which is what this did before.
 fn split_stacked_experts(t: &QTensor, device: &Device) -> Result<Vec<QMatMul>> {
     let (n_experts, n_out, n_in) = t.shape().dims3()?;
     let dtype = t.dtype();
-    let data = t.data()?;
-    let per_expert = data.len() / n_experts;
-    if per_expert * n_experts != data.len() {
+    let total = t.storage_size_in_bytes();
+    let per_expert = total / n_experts;
+    if per_expert * n_experts != total {
         candle::bail!(
-            "expert stack {:?} of {} bytes does not divide evenly into {n_experts} experts",
+            "expert stack {:?} of {total} bytes does not divide evenly into {n_experts} experts",
             t.shape().dims(),
-            data.len()
         )
     }
+
     let mut out = Vec::with_capacity(n_experts);
+    if let Some(first) = t.byte_view(0, per_expert, (n_out, n_in))? {
+        out.push(QMatMul::from_weights(Arc::new(first))?);
+        for e in 1..n_experts {
+            let view = t
+                .byte_view(e * per_expert, per_expert, (n_out, n_in))?
+                .ok_or_else(|| {
+                    candle::Error::Msg(format!(
+                    "expert {e} of {n_experts} could not be aliased at byte {} though expert 0 \
+                     could; refusing to mix borrowed and copied experts",
+                    e * per_expert
+                ))
+                })?;
+            out.push(QMatMul::from_weights(Arc::new(view))?);
+        }
+        return Ok(out);
+    }
+
+    let data = t.data()?;
     for e in 0..n_experts {
         let bytes = &data[e * per_expert..(e + 1) * per_expert];
         let storage = QStorage::from_data(Cow::Borrowed(bytes), device, dtype)?;
@@ -212,6 +267,20 @@ pub struct MoeWeights {
     num_experts_per_tok: usize,
     /// Quant types actually read off THIS layer's tensors, not assumed from another layer.
     expert_quants: ExpertQuants,
+    /// The undivided `[n_experts, n_out, n_in]` stacks, kept only for [`MoeMode::Fused`]: the
+    /// `mul_mv_id` kernel addresses experts as `base + expert_id * stride`, which needs one
+    /// allocation. The per-expert `QMatMul`s above are views into these, so holding both costs
+    /// no extra memory.
+    stacked: Option<StackedExperts>,
+    mode: MoeMode,
+}
+
+/// The three routed-expert weight stacks, undivided.
+#[derive(Debug, Clone)]
+struct StackedExperts {
+    gate: Arc<QTensor>,
+    up: Arc<QTensor>,
+    down: Arc<QTensor>,
 }
 
 impl MoeWeights {
@@ -219,6 +288,7 @@ impl MoeWeights {
         gg: &mut Gguf<R>,
         prefix: &str,
         num_experts_per_tok: usize,
+        mode: MoeMode,
     ) -> Result<Self> {
         let device = gg.device.clone();
         let router = gg
@@ -246,6 +316,15 @@ impl MoeWeights {
             down: down_dtype,
         };
 
+        let stacked = match mode {
+            MoeMode::Loop => None,
+            MoeMode::Fused => Some(StackedExperts {
+                gate: Arc::new(gate_exps_t),
+                up: Arc::new(up_exps_t),
+                down: Arc::new(down_exps_t),
+            }),
+        };
+
         let shared_router = gg
             .tensor(&format!("{prefix}.ffn_gate_inp_shexp.weight"))?
             .dequantize(&device)?
@@ -268,6 +347,8 @@ impl MoeWeights {
             shared_down,
             num_experts_per_tok,
             expert_quants,
+            stacked,
+            mode,
         })
     }
 
@@ -282,18 +363,14 @@ impl MoeWeights {
         let up = self.up_experts[e].forward(xs)?;
         self.down_experts[e].forward(&(gate * up)?)
     }
-}
 
-impl Module for MoeWeights {
-    fn forward(&self, x: &Tensor) -> Result<Tensor> {
-        let (b, t, hidden) = x.dims3()?;
-        let original_dtype = x.dtype();
-        let xs = x.reshape(((), hidden))?.to_dtype(DType::F32)?;
-        let n_tokens = b * t;
-
+    /// Router logits -> softmax -> top-k -> renormalise. Shared by both modes so the two arms
+    /// cannot drift: everything that decides WHICH experts run lives here exactly once.
+    ///
+    /// Returns `(ids, weights)`, both `[n_tokens, k]`, ids as u32.
+    fn route(&self, xs: &Tensor) -> Result<(Tensor, Tensor)> {
         let logits = xs.matmul(&self.router.t()?.contiguous()?)?;
         let probs = candle_nn::ops::softmax_last_dim(&logits)?;
-
         let k = self.num_experts_per_tok;
         // `narrow` on an argsort is a view; the gather below needs it contiguous.
         let topk_ids = probs
@@ -303,12 +380,27 @@ impl Module for MoeWeights {
         let weights = probs.gather(&topk_ids, D::Minus1)?;
         // Clamp exactly as llama.cpp does (llama-graph.cpp:2061) so a degenerate row cannot divide
         // by zero.
-        let denom = weights.sum_keepdim(D::Minus1)?.clamp(6.103515625e-5, f64::INFINITY)?;
+        let denom = weights
+            .sum_keepdim(D::Minus1)?
+            .clamp(6.103515625e-5, f64::INFINITY)?;
         let weights = weights.broadcast_div(&denom)?;
+        Ok((topk_ids, weights))
+    }
 
-        // Group tokens by expert so each expert runs ONE matmul over all its rows, instead of one
-        // matmul per (token, slot). Without this a 5304-token prefill would issue 42k matmuls per
-        // projection per layer. Routing is read back to host because it drives control flow.
+    /// The routed experts, as `n_experts` grouped plain matmuls. Returns `[n_tokens, hidden]`.
+    ///
+    /// Routing is read back to host because it drives control flow, which forces a GPU sync.
+    /// Grouping is what makes this tolerable at all: without it a 5304-token prefill would issue
+    /// 42k matmuls per projection per layer.
+    fn routed_loop(
+        &self,
+        xs: &Tensor,
+        topk_ids: &Tensor,
+        weights: &Tensor,
+        n_tokens: usize,
+        hidden: usize,
+    ) -> Result<Tensor> {
+        let k = self.num_experts_per_tok;
         let ids_host = topk_ids.flatten_all()?.to_vec1::<u32>()?;
         let w_host = weights.flatten_all()?.to_vec1::<f32>()?;
         let n_experts = self.gate_experts.len();
@@ -332,6 +424,69 @@ impl Module for MoeWeights {
             let w = Tensor::from_slice(&coefs[e], (rows[e].len(), 1), device)?;
             out = out.index_add(&idx, &ye.broadcast_mul(&w)?, 0)?;
         }
+        Ok(out)
+    }
+
+    /// The routed experts, as three fused `mul_mv_id` dispatches. Returns `[n_tokens, hidden]`.
+    ///
+    /// Entirely on device: the routing is never read back, so the decode step loses the sync that
+    /// [`MoeWeights::routed_loop`] needs. Decode only -- one `mul_mv_id` threadgroup re-reads a
+    /// whole expert matrix, which is the right trade for a single token and catastrophically the
+    /// wrong one for a 5304-token prefill (Task 4's `mm_id` is the prefill answer).
+    ///
+    /// The top-k slots are sorted by ASCENDING EXPERT ID before the weighted sum. That is not
+    /// cosmetic: `routed_loop` accumulates `out += w_e * y_e` walking `e` from 0 upward, and f32
+    /// addition is not associative, so summing the same eight terms in descending-probability
+    /// order can differ in the last bit -- enough to flip an argmax and fail the token-id
+    /// equivalence gate for a reason that is not a bug in the kernel.
+    fn routed_fused(
+        &self,
+        xs: &Tensor,
+        stacked: &StackedExperts,
+        topk_ids: &Tensor,
+        weights: &Tensor,
+        n_tokens: usize,
+        hidden: usize,
+    ) -> Result<Tensor> {
+        let k = self.num_experts_per_tok;
+        // arg_sort over the ids themselves; f32 because every expert id (< 2^24) is exact there
+        // and candle's arg_sort is defined for it on every backend.
+        let order = topk_ids
+            .to_dtype(DType::F32)?
+            .arg_sort_last_dim(true)?
+            .contiguous()?;
+        let topk_ids = topk_ids.gather(&order, D::Minus1)?.contiguous()?;
+        let weights = weights.gather(&order, D::Minus1)?.contiguous()?;
+
+        // [n_tokens, 1, hidden]: dim 1 of 1 tells the kernel to feed the same token vector to
+        // every one of the k slots.
+        let x3 = xs.reshape((n_tokens, 1, hidden))?;
+        let gate = stacked.gate.indexed_moe_forward(&x3, &topk_ids)?;
+        let up = stacked.up.indexed_moe_forward(&x3, &topk_ids)?;
+        let h = (candle_nn::ops::silu(&gate)? * up)?.contiguous()?;
+        // [n_tokens, k, n_ff]: dim 1 of k tells the kernel each slot has its own input row.
+        let y = stacked.down.indexed_moe_forward(&h, &topk_ids)?;
+        let w = weights.reshape((n_tokens, k, 1))?;
+        y.broadcast_mul(&w)?.sum(1)
+    }
+}
+
+impl Module for MoeWeights {
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let (b, t, hidden) = x.dims3()?;
+        let original_dtype = x.dtype();
+        let xs = x.reshape(((), hidden))?.to_dtype(DType::F32)?;
+        let n_tokens = b * t;
+
+        let (topk_ids, weights) = self.route(&xs)?;
+
+        // The fused kernel is a DECODE kernel; prefill stays on the grouped loop until Task 4.
+        let out = match (self.mode, self.stacked.as_ref()) {
+            (MoeMode::Fused, Some(stacked)) if n_tokens == 1 => {
+                self.routed_fused(&xs, stacked, &topk_ids, &weights, n_tokens, hidden)?
+            }
+            _ => self.routed_loop(&xs, &topk_ids, &weights, n_tokens, hidden)?,
+        };
 
         // Shared expert, applied to every token and gated by its own sigmoid scalar.
         let sh_gate = candle_nn::ops::silu(&self.shared_gate.forward(&xs)?)?;
@@ -900,6 +1055,7 @@ impl LayerWeights {
         hidden_size: usize,
         num_experts: usize,
         num_experts_per_tok: usize,
+        moe_mode: MoeMode,
     ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         let is_full_attention = (layer_idx + 1).is_multiple_of(full_attention_interval);
@@ -932,7 +1088,7 @@ impl LayerWeights {
         // conclusion via `decoder_sparse_step` defaulting to 1 (qwen35moe has no such key), so the
         // condition reduces to `expert_count > 0`. Qwen3.6-35B-A3B: 40 of 40 layers.
         let mlp = if num_experts > 0 {
-            Ffn::Moe(MoeWeights::new(gg, &prefix, num_experts_per_tok)?)
+            Ffn::Moe(MoeWeights::new(gg, &prefix, num_experts_per_tok, moe_mode)?)
         } else {
             Ffn::Dense(MlpWeights::new(gg, &prefix)?)
         };
@@ -988,6 +1144,19 @@ impl ModelWeights {
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
+    ) -> Result<Self> {
+        Self::from_gguf_with_moe(ct, reader, device, MoeMode::default())
+    }
+
+    /// As [`ModelWeights::from_gguf`], but picking how the routed experts are evaluated.
+    ///
+    /// The mode is a LOAD-time choice, not a per-call one, because [`MoeMode::Fused`] has to keep
+    /// the undivided expert stacks alive for the `mul_mv_id` kernel to index into.
+    pub fn from_gguf_with_moe<R: Read + Seek>(
+        ct: gguf_file::Content,
+        reader: &mut R,
+        device: &Device,
+        moe_mode: MoeMode,
     ) -> Result<Self> {
         let mut gg = Gguf::new(ct, reader, device.clone());
         // Key prefixes come from the file's own `general.architecture`, not from a hardcoded
@@ -1082,6 +1251,7 @@ impl ModelWeights {
                 hidden_size,
                 num_experts,
                 num_experts_per_tok,
+                moe_mode,
             )?);
         }
 
@@ -1156,8 +1326,8 @@ mod tests {
         if !path.exists() {
             panic!("35B GGUF required for this test: {}", path.display());
         }
-        let quants =
-            read_expert_quants_per_layer(path).expect("failed to read expert quant types from the 35B GGUF");
+        let quants = read_expert_quants_per_layer(path)
+            .expect("failed to read expert quant types from the 35B GGUF");
         assert_eq!(quants.len(), 40);
 
         let downs: std::collections::HashSet<_> = quants.iter().map(|q| q.down).collect();
@@ -1166,9 +1336,17 @@ mod tests {
             "expected ffn_down_exps to carry MORE THAN ONE quant type across layers, got {downs:?} \
              -- if this fails the loader is collapsing per-layer types"
         );
-        assert_eq!(quants.iter().filter(|q| q.down == GgmlDType::Q6K).count(), 3);
-        assert_eq!(quants.iter().filter(|q| q.down == GgmlDType::Q5K).count(), 37);
-        assert!(quants.iter().all(|q| q.gate == GgmlDType::Q4K && q.up == GgmlDType::Q4K));
+        assert_eq!(
+            quants.iter().filter(|q| q.down == GgmlDType::Q6K).count(),
+            3
+        );
+        assert_eq!(
+            quants.iter().filter(|q| q.down == GgmlDType::Q5K).count(),
+            37
+        );
+        assert!(quants
+            .iter()
+            .all(|q| q.gate == GgmlDType::Q4K && q.up == GgmlDType::Q4K));
 
         // Assert layer IDENTITY, not just the multiset. A loader that reads the correct set of
         // types but assigns them to the wrong layer indices (an off-by-one in the loop, a

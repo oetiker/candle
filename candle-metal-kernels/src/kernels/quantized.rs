@@ -34,6 +34,9 @@ pub fn call_quantized_matmul_mv_t(
     lhs: &Buffer,
     lhs_offset: usize,
     rhs: &Buffer,
+    // Byte offset of the weights inside `rhs`. Non-zero when the weight tensor is a view into a
+    // larger allocation, e.g. one expert of a stacked MoE weight.
+    rhs_offset: usize,
     dst_offset: usize,
     dst: &Buffer,
 ) -> Result<(), MetalKernelError> {
@@ -61,58 +64,7 @@ pub fn call_quantized_matmul_mv_t(
     let r2: u32 = (ne12 / ne02) as u32;
     let r3: u32 = (ne13 / ne03) as u32;
 
-    let (nth0, nth1, align) = match dtype {
-        GgmlDType::Q4_0
-        | GgmlDType::Q4_1
-        | GgmlDType::Q5_0
-        | GgmlDType::Q5_1
-        | GgmlDType::Q8_0
-        | GgmlDType::Q8_1 => {
-            let nth0 = 8;
-            let nth1 = 8;
-            let align = 8;
-            (nth0, nth1, align)
-        }
-        GgmlDType::Q2K => {
-            // Fixing a bug in Metal for GGML
-            // https://github.com/ggerganov/llama.cpp/blob/b8109bc0139f15a5b321909f47510b89dca47ffc/ggml-metal.m#L1576
-            let nth0 = 2;
-            let nth1 = 32;
-            let align = 4;
-            (nth0, nth1, align)
-        }
-        GgmlDType::Q4K => {
-            let nth0 = 4;
-            let nth1 = 8;
-            let align = 4;
-            (nth0, nth1, align)
-        }
-        GgmlDType::Q3K | GgmlDType::Q5K => {
-            let nth0 = 2;
-            let nth1 = 32;
-            let align = 4;
-            (nth0, nth1, align)
-        }
-        GgmlDType::Q6K => {
-            let nth0 = 2;
-            let nth1 = 32;
-            let align = 2;
-            (nth0, nth1, align)
-        }
-        GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::Q8K => {
-            // Original implem uses rows
-            let nth0 = 32;
-            let nth1 = 1;
-            let align = 8;
-            (nth0, nth1, align)
-        }
-        GgmlDType::F32 => {
-            let nth0 = 32;
-            let nth1 = 1;
-            let align = 8;
-            (nth0, nth1, align)
-        }
-    };
+    let (nth0, nth1, align) = mv_threadgroup_shape(dtype);
     let thread_groups_count = MTLSize {
         width: divide(ne01 as usize, align),
         height: ne11 as usize,
@@ -150,7 +102,7 @@ pub fn call_quantized_matmul_mv_t(
     set_params!(
         encoder,
         (
-            rhs,
+            (rhs, rhs_offset),
             (lhs, lhs_offset),
             Output::with_offset(dst, dst_offset),
             ne00,
@@ -176,6 +128,176 @@ pub fn call_quantized_matmul_mv_t(
     Ok(())
 }
 
+/// Rows of `src0` a single threadgroup of `kernel_mul_mv_*_f32` (and hence of
+/// `kernel_mul_mv_id_*_f32`) produces, together with the threadgroup shape that produces them.
+/// These are properties of the kernel bodies, not tuning knobs: `kernel_mul_mv_q6_K_f32_impl`
+/// writes `2*r0 + sgitg`, so two rows per threadgroup and nothing else will do.
+fn mv_threadgroup_shape(dtype: GgmlDType) -> (usize, usize, usize) {
+    match dtype {
+        GgmlDType::Q4_0
+        | GgmlDType::Q4_1
+        | GgmlDType::Q5_0
+        | GgmlDType::Q5_1
+        | GgmlDType::Q8_0
+        | GgmlDType::Q8_1 => (8, 8, 8),
+        // Fixing a bug in Metal for GGML
+        // https://github.com/ggerganov/llama.cpp/blob/b8109bc0139f15a5b321909f47510b89dca47ffc/ggml-metal.m#L1576
+        GgmlDType::Q2K => (2, 32, 4),
+        GgmlDType::Q4K => (4, 8, 4),
+        GgmlDType::Q3K | GgmlDType::Q5K => (2, 32, 4),
+        GgmlDType::Q6K => (2, 32, 2),
+        GgmlDType::F16 | GgmlDType::BF16 | GgmlDType::Q8K | GgmlDType::F32 => (32, 1, 8),
+    }
+}
+
+/// Fused MoE matrix-vector: one quantized matmul per (token, expert-slot), reading each slot's
+/// weights straight out of the stacked `[n_experts, n, k]` tensor at `expert_id * nb02`.
+///
+/// This binds `kernel_mul_mv_id`, which is ggml's and which THIS FILE ALREADY CONTAINED --
+/// `quantized.metal` is ggml-derived and carries the `_id` wrappers for q4_K, q5_K, q6_K and
+/// q8_0 along with everything else. What was missing was only a Rust caller: nothing in candle
+/// ever dispatched them, because `candle_nn::moe` routes quantized MoE to CUDA. So no kernel had
+/// to be written, and none was: the shader below the Rust is untouched ggml.
+///
+/// It replaces the "split the stack into `n_experts` 2-D tensors, group the tokens on the host,
+/// and issue one matmul per non-empty group" loop, which for a single decode token means eight
+/// dispatches plus a routing readback that forces a GPU sync.
+///
+/// Shapes follow `QCudaStorage::indexed_moe_forward`, so the two backends present one contract:
+/// - `src0` `[n_experts, n, k]`, quantized, expert stride `expert_stride_bytes`
+/// - `src1` `[batch, in_dim1, k]` f32, `in_dim1` either 1 (gate/up) or `topk` (down)
+/// - `ids`  `[batch, topk]` u32
+/// - `dst`  `[batch, topk, n]` f32
+///
+/// `dtype` MUST be the quant type of the tensor actually being multiplied. The 35B's
+/// `ffn_down_exps` is Q5_K on 37 layers and Q6_K on 3, so a caller that reads the type once and
+/// reuses it silently mis-dequantizes three layers.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mv_id(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    (n_experts, n, k): (usize, usize, usize),
+    (batch, in_dim1, topk): (usize, usize, usize),
+    // Bytes between consecutive experts in `src0`. The caller computes it from the block layout
+    // (`n * k / block_size * type_size`); it is not derivable here because this crate's
+    // `GgmlDType` carries no block geometry.
+    expert_stride_bytes: usize,
+    src0: &Buffer,
+    src0_offset: usize,
+    src1: &Buffer,
+    src1_offset: usize,
+    ids: &Buffer,
+    ids_offset: usize,
+    dst: &Buffer,
+    dst_offset: usize,
+) -> Result<(), MetalKernelError> {
+    let name = match dtype {
+        GgmlDType::Q4K => "kernel_mul_mv_id_q4_K_f32",
+        GgmlDType::Q5K => "kernel_mul_mv_id_q5_K_f32",
+        GgmlDType::Q6K => "kernel_mul_mv_id_q6_K_f32",
+        GgmlDType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
+        GgmlDType::Q4_0 => "kernel_mul_mv_id_q4_0_f32",
+        GgmlDType::Q4_1 => "kernel_mul_mv_id_q4_1_f32",
+        GgmlDType::Q5_0 => "kernel_mul_mv_id_q5_0_f32",
+        GgmlDType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
+        GgmlDType::Q2K => "kernel_mul_mv_id_q2_K_f32",
+        GgmlDType::Q3K => "kernel_mul_mv_id_q3_K_f32",
+        GgmlDType::F16 => "kernel_mul_mv_id_f16_f32",
+        GgmlDType::F32 => "kernel_mul_mv_id_f32_f32",
+        GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "mul_mv_id"))?,
+        GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "mul_mv_id"))?,
+        GgmlDType::BF16 => Err(MetalKernelError::UnsupportedDTypeForOp("BF16", "mul_mv_id"))?,
+    };
+    if n_experts == 0 {
+        return Err(MetalKernelError::InvalidInput(
+            "mul_mv_id: expert stack is empty".to_string(),
+        ));
+    }
+    if in_dim1 != 1 && in_dim1 != topk {
+        return Err(MetalKernelError::InvalidInput(format!(
+            "mul_mv_id: src1 dim1 {in_dim1} must be 1 or topk {topk}"
+        )));
+    }
+    let (nth0, nth1, align) = mv_threadgroup_shape(dtype);
+    if !n.is_multiple_of(align) {
+        return Err(MetalKernelError::InvalidInput(format!(
+            "mul_mv_id {name}: output dim {n} is not a multiple of the kernel's {align} rows per \
+             threadgroup; the kernel writes past the row it was asked for"
+        )));
+    }
+
+    let f32_size = core::mem::size_of::<f32>();
+    let ne00 = k as i64;
+    let ne01 = n as i64;
+    let nb02 = expert_stride_bytes as u64;
+    // src1 is contiguous [batch, in_dim1, k] f32. nb11 walks a slot, nb12 walks a token.
+    let nb10 = f32_size as u64;
+    let nb11 = (k * f32_size) as u64;
+    let nb12 = (in_dim1 * k * f32_size) as u64;
+    // ne1 is what the kernel multiplies iid1 by when it rebases dst, so it must be topk: dst is
+    // [batch, topk, n] and dst_cur = dst + idx*ne0 + iid1*ne1*ne0.
+    let ne1 = topk as i64;
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "qmm_mv_id {name} experts={n_experts} N={n} K={k} batch={batch} topk={topk}"
+    );
+
+    set_params!(
+        encoder,
+        (
+            (src0, src0_offset),
+            (src1, src1_offset),
+            Output::with_offset(dst, dst_offset),
+            (ids, ids_offset),
+            topk as i64,                                 // nei0
+            batch as i64,                                // nei1
+            (topk * core::mem::size_of::<u32>()) as u64, // nbi1
+            ne00,
+            ne01,
+            1i64, // ne02, forced to 1 inside the kernel
+            0u64, // nb00, unused by the k-quant impls
+            0u64, // nb01, ditto
+            nb02,
+            ne00,           // ne10
+            in_dim1 as i64, // ne11
+            1i64,           // ne12
+            1i64,           // ne13
+            nb10,
+            nb11,
+            nb12,
+            ne01, // ne0
+            ne1,
+            0u64 // nb1, unused by the k-quant impls
+        )
+    );
+
+    // kernel_mul_mv_id declares `threadgroup int8_t * shared_values [[threadgroup(0)]]`. The
+    // k-quant impls it is instantiated with never read it, but Metal still needs a length bound
+    // for the binding; 8192 is what ggml allocates here.
+    encoder.set_threadgroup_memory_length(0, 8192);
+
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: divide(n, align),
+            height: 1,
+            depth: batch * topk,
+        },
+        MTLSize {
+            width: nth0,
+            height: nth1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
 /// - src0 is usually weight
 /// - src1 is usually xs
 #[allow(clippy::too_many_arguments)]
@@ -187,6 +309,8 @@ pub fn call_quantized_matmul_mm_t(
     src0_shape: &[usize],
     src0_stride: &[usize],
     src0: &Buffer,
+    // Byte offset of the weights inside `src0`; see `call_quantized_matmul_mv_t`.
+    src0_offset: usize,
     src1_shape: &[usize],
     src1_stride: &[usize],
     src1: &Buffer,
@@ -256,7 +380,7 @@ pub fn call_quantized_matmul_mm_t(
     set_params!(
         encoder,
         (
-            src0,
+            (src0, src0_offset),
             (src1, src1_offset),
             Output::with_offset(dst, dst_offset),
             ne00,

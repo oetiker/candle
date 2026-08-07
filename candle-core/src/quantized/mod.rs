@@ -777,9 +777,51 @@ impl QTensor {
                     panic!("Non-cuda indexed_moe_forward is not implemented!");
                 }
             },
-            _ => {
-                panic!("indexed_moe_forward is not implemented in this platform!");
+            QStorage::Metal(s) => match (&*x.storage(), &*ids.storage()) {
+                (Storage::Metal(x_storage), Storage::Metal(ids_storage)) => {
+                    let (storage, out_shape) = s.indexed_moe_forward(
+                        self.shape(),
+                        x_storage,
+                        x.layout(),
+                        ids_storage,
+                        ids.layout(),
+                    )?;
+                    Ok(crate::tensor::from_storage(
+                        Storage::Metal(storage),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
+                }
+                _ => crate::bail!("indexed_moe_forward: x and ids must be on the Metal device"),
+            },
+            QStorage::Cpu(_) => {
+                crate::bail!("indexed_moe_forward is not implemented for the CPU backend")
             }
+        }
+    }
+
+    /// A `QTensor` of `shape` borrowing `size_in_bytes` bytes at `offset` inside this tensor's
+    /// storage, without copying. Metal only. Used to expose the individual experts of a stacked
+    /// `[n_experts, n, k]` MoE weight as `[n, k]` matrices while the stack itself stays live for
+    /// the fused kernel, so the expert weights are stored exactly once.
+    ///
+    /// Returns `None` when the backend cannot alias (CPU, CUDA) or the offset is not suitably
+    /// aligned, so the caller can fall back to copying rather than fail.
+    pub fn byte_view<S: Into<Shape>>(
+        &self,
+        offset: usize,
+        size_in_bytes: usize,
+        shape: S,
+    ) -> Result<Option<Self>> {
+        match &self.storage {
+            // 256 is the alignment QMetalStorage::view enforces; check it here too so an
+            // unalignable layout becomes a fallback rather than an error.
+            QStorage::Metal(s) if offset.is_multiple_of(256) => {
+                let storage = QStorage::Metal(s.view(offset, size_in_bytes)?);
+                Ok(Some(Self::new(storage, shape)?))
+            }
+            _ => Ok(None),
         }
     }
 

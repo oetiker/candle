@@ -8,6 +8,13 @@ pub struct QMetalStorage {
     dtype: GgmlDType,
     device: MetalDevice,
     buffer: Arc<Buffer>,
+    /// Byte offset of this tensor's data inside `buffer`, and its byte length. Non-zero offsets
+    /// come from [`QMetalStorage::view`]: several `QTensor`s can then share one allocation, which
+    /// is how the routed experts of a stacked `[n_experts, n, k]` MoE weight are exposed both as
+    /// one stack (for the fused `mul_mv_id` kernel) and as `n_experts` 2-D matrices (for the
+    /// grouped loop) without storing the ~20 GB of expert weights twice.
+    offset: usize,
+    size: usize,
 }
 
 impl QMetalStorage {
@@ -22,6 +29,34 @@ impl QMetalStorage {
             buffer,
             device: device.clone(),
             dtype,
+            offset: 0,
+            size,
+        })
+    }
+
+    /// A borrow of `size` bytes at `offset` inside this storage's buffer, as a storage in its own
+    /// right. No copy and no new allocation: the returned value keeps the same `Arc<Buffer>`.
+    ///
+    /// `offset` must be 256-byte aligned. Metal only demands 4 on Apple silicon, but 256 is the
+    /// documented worst case for `setBuffer:offset:` and every expert stride this is used for
+    /// (Q4_K 589824 B, Q5_K 720896 B, Q6_K 860160 B) already satisfies it -- so requiring it
+    /// costs nothing and cannot produce a silently misaligned read on some other device.
+    pub fn view(&self, offset: usize, size: usize) -> Result<Self> {
+        if !offset.is_multiple_of(256) {
+            crate::bail!("QMetalStorage::view offset {offset} is not 256-byte aligned")
+        }
+        if offset + size > self.size {
+            crate::bail!(
+                "QMetalStorage::view {offset}+{size} out of bounds for {} bytes",
+                self.size
+            )
+        }
+        Ok(Self {
+            dtype: self.dtype,
+            device: self.device.clone(),
+            buffer: self.buffer.clone(),
+            offset: self.offset + offset,
+            size,
         })
     }
 
@@ -37,19 +72,24 @@ impl QMetalStorage {
         &self.buffer
     }
 
+    /// Byte offset of this storage's data inside [`QMetalStorage::buffer`].
+    pub fn buffer_offset(&self) -> usize {
+        self.offset
+    }
+
     pub fn dequantize(&self, elem_count: usize) -> Result<MetalStorage> {
         use crate::quantized::k_quants::GgmlType;
 
         let buffer = self
             .device
             .new_buffer_builder()
-            .with_size(self.buffer.length())
+            .with_size(self.size)
             .with_label("qstorage_dequantize_blit")
             .build()?;
         {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
-            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
+            blit.copy_from_buffer(&self.buffer, self.offset, &buffer, 0, self.size);
         }
         self.device.flush_and_wait_current()?;
         let mut out = vec![0.0; elem_count];
@@ -138,14 +178,14 @@ impl QMetalStorage {
         let src = crate::Storage::Cpu(crate::CpuStorage::F32(src));
         let mut qcpu_storage = crate::Device::Cpu.qzeros(elem_count, self.dtype)?;
         qcpu_storage.quantize(&src)?;
+        let data = qcpu_storage.data()?;
         let buffer = self
             .device
             .new_buffer_builder()
-            .with_data(&qcpu_storage.data()?)
+            .with_data(&data)
             .with_label("qstorage_quantized")
             .build()?;
-        self.buffer = buffer;
-        Ok(())
+        self.replace_buffer(buffer, data.len())
     }
 
     pub fn quantize_imatrix(
@@ -160,14 +200,14 @@ impl QMetalStorage {
         let src = crate::Storage::Cpu(crate::CpuStorage::F32(src));
         let mut qcpu_storage = crate::Device::Cpu.qzeros(elem_count, self.dtype)?;
         qcpu_storage.quantize_imatrix(&src, imatrix_weights, n_per_row)?;
+        let data = qcpu_storage.data()?;
         let buffer = self
             .device
             .new_buffer_builder()
-            .with_data(&qcpu_storage.data()?)
+            .with_data(&data)
             .with_label("qstorage_quantize_imatrix")
             .build()?;
-        self.buffer = buffer;
-        Ok(())
+        self.replace_buffer(buffer, data.len())
     }
 
     pub fn quantize_imatrix_onto(
@@ -186,14 +226,14 @@ impl QMetalStorage {
             unreachable!()
         }
 
+        let data = qcpu_storage.data()?;
         let buffer = self
             .device
             .new_buffer_builder()
-            .with_data(&qcpu_storage.data()?)
+            .with_data(&data)
             .with_label("qstorage_quantize_imatrix_onto")
             .build()?;
-        self.buffer = buffer;
-        Ok(())
+        self.replace_buffer(buffer, data.len())
     }
 
     pub fn quantize_onto(&mut self, src: &crate::CpuStorage) -> Result<()> {
@@ -207,18 +247,32 @@ impl QMetalStorage {
             unreachable!()
         }
 
+        let data = qcpu_storage.data()?;
         let buffer = self
             .device
             .new_buffer_builder()
-            .with_data(&qcpu_storage.data()?)
+            .with_data(&data)
             .with_label("qstorage_quantize_onto")
             .build()?;
+        self.replace_buffer(buffer, data.len())
+    }
+
+    /// Swap in freshly quantized contents. Refuses to do so for a view: a view borrows someone
+    /// else's allocation, so re-pointing it would silently orphan the tensor it was carved from.
+    fn replace_buffer(&mut self, buffer: Arc<Buffer>, size: usize) -> Result<()> {
+        if self.offset != 0 {
+            crate::bail!(
+                "cannot quantize into a QMetalStorage view (offset {})",
+                self.offset
+            )
+        }
         self.buffer = buffer;
+        self.size = size;
         Ok(())
     }
 
     pub fn storage_size_in_bytes(&self) -> usize {
-        self.buffer.length()
+        self.size
     }
 
     pub fn embedding(
@@ -248,6 +302,11 @@ impl QMetalStorage {
                 "quantized tensor has {} bytes, expected {expected_size}",
                 self.storage_size_in_bytes()
             )
+        }
+        if self.offset != 0 {
+            // call_quantized_get_rows takes no src offset; rather than read from the wrong place,
+            // say so.
+            crate::bail!("quantized embedding is not implemented for a QMetalStorage view")
         }
         let ids_len = ids_l.shape().elem_count();
         let device = self.device.clone();
@@ -331,6 +390,7 @@ impl QMetalStorage {
                 storage.buffer(),
                 (layout.start_offset() + batch_id * k) * storage.dtype().size_in_bytes(),
                 &self.buffer,
+                self.offset,
                 batch_id * n * DType::F32.size_in_bytes(),
                 &dst,
             )
@@ -419,6 +479,7 @@ impl QMetalStorage {
             src0_l.dims(),
             &src0_stride,
             &self.buffer,
+            self.offset,
             src1_l.dims(),
             &src1_l
                 .stride()
@@ -438,17 +499,104 @@ impl QMetalStorage {
         Ok((dst_storage, dst_shape))
     }
 
+    /// Fused MoE matrix-vector against a stacked `[n_experts, n, k]` weight.
+    ///
+    /// Same contract as `QCudaStorage::indexed_moe_forward`, so a model can call one method and
+    /// get the right kernel on either backend:
+    /// - `self`  `[n_experts, n, k]` quantized
+    /// - `input` `[batch, in_dim1, k]` f32, `in_dim1` either 1 (broadcast the token to every
+    ///   expert slot, as gate/up want) or `topk` (one row per slot, as down wants)
+    /// - `ids`   `[batch, topk]` u32
+    /// - returns `[batch, topk, n]` f32
+    ///
+    /// The quant type used is `self.dtype`, i.e. the type of THIS tensor. The 35B's
+    /// `ffn_down_exps` is Q5_K on 37 layers and Q6_K on 3, so nothing here may be hoisted to a
+    /// per-model constant.
+    pub fn indexed_moe_forward(
+        &self,
+        self_shape: &Shape,
+        input: &MetalStorage,
+        input_l: &Layout,
+        ids: &MetalStorage,
+        ids_l: &Layout,
+    ) -> Result<(MetalStorage, Shape)> {
+        use crate::MetalError;
+
+        let (n_experts, n, k) = self_shape.dims3()?;
+        if !input_l.is_contiguous() || !ids_l.is_contiguous() {
+            crate::bail!("indexed_moe_forward requires contiguous input and ids")
+        }
+        if input.dtype() != DType::F32 {
+            crate::bail!(
+                "indexed_moe_forward expects f32 input, got {:?}",
+                input.dtype()
+            )
+        }
+        if ids.dtype() != DType::U32 {
+            crate::bail!("indexed_moe_forward expects u32 ids, got {:?}", ids.dtype())
+        }
+        let (batch, in_dim1, in_k) = input_l.shape().dims3()?;
+        let (ids_batch, topk) = ids_l.shape().dims2()?;
+        if in_k != k {
+            crate::bail!("indexed_moe_forward input k {in_k} != weight k {k}")
+        }
+        if ids_batch != batch {
+            crate::bail!("indexed_moe_forward batch mismatch: input {batch}, ids {ids_batch}")
+        }
+        if in_dim1 != 1 && in_dim1 != topk {
+            crate::bail!("indexed_moe_forward input dim1 {in_dim1} must be 1 or topk {topk}")
+        }
+        let expert_stride_bytes = n * k / self.dtype.block_size() * self.dtype.type_size();
+        if expert_stride_bytes * n_experts != self.size {
+            crate::bail!(
+                "indexed_moe_forward: {n_experts} experts of {expert_stride_bytes} bytes do not \
+                 fill this tensor's {} bytes",
+                self.size
+            )
+        }
+
+        let dst_shape = Shape::from((batch, topk, n));
+        let device = input.device().clone();
+        let dst = device
+            .new_buffer_builder()
+            .with_size_for(dst_shape.elem_count(), DType::F32)
+            .with_label("qmoe_mv_id")
+            .build()?;
+        let encoder = device.command_encoder()?;
+        candle_metal_kernels::call_quantized_matmul_mv_id(
+            device.device(),
+            &encoder,
+            device.kernels(),
+            self.dtype.into(),
+            (n_experts, n, k),
+            (batch, in_dim1, topk),
+            expert_stride_bytes,
+            &self.buffer,
+            self.offset,
+            input.buffer(),
+            input_l.start_offset() * DType::F32.size_in_bytes(),
+            ids.buffer(),
+            ids_l.start_offset() * DType::U32.size_in_bytes(),
+            &dst,
+            0,
+        )
+        .map_err(MetalError::from)?;
+        let dst_storage =
+            crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
+        Ok((dst_storage, dst_shape))
+    }
+
     pub fn data(&self) -> Result<Vec<u8>> {
         let buffer = self
             .device
             .new_buffer_builder()
-            .with_size(self.buffer.length())
+            .with_size(self.size)
             .with_label("qstorage_data_blit")
             .build()?;
         {
             let mut blit = self.device.blit_command_encoder()?;
             blit.set_label("blit_to_cpu");
-            blit.copy_from_buffer(&self.buffer, 0, &buffer, 0, self.buffer.length());
+            blit.copy_from_buffer(&self.buffer, self.offset, &buffer, 0, self.size);
         }
         self.device.flush_and_wait_current()?;
         Ok(read_to_vec::<u8>(&buffer, self.storage_size_in_bytes()))
@@ -465,10 +613,13 @@ pub fn load_quantized<T: super::GgmlType + Send + Sync + 'static>(
         .with_label("qstorage_load_quantized")
         .build()?;
     let device = device.clone();
+    let size = std::mem::size_of_val(data);
     Ok(QStorage::Metal(QMetalStorage {
         dtype: T::DTYPE,
         device,
         buffer,
+        offset: 0,
+        size,
     }))
 }
 
