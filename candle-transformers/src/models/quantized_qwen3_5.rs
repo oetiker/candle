@@ -9,7 +9,7 @@
 use super::with_tracing::QMatMul;
 use crate::models::qwen3_5_linear_attn_scan::{gated_delta_rule_chunked, sequential_step};
 use crate::{quantized_nn::RmsNorm, utils::repeat_kv};
-use candle::quantized::{gguf_file, QStorage, QTensor};
+use candle::quantized::{gguf_file, GgmlDType, QStorage, QTensor};
 use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::{kv_cache::ConcatKvCache, Activation, Embedding};
 use std::borrow::Cow;
@@ -79,6 +79,74 @@ impl Module for MlpWeights {
     }
 }
 
+/// Per-layer quant types for the three routed-expert weight stacks (`ffn_gate_exps`,
+/// `ffn_up_exps`, `ffn_down_exps`). unsloth's dynamic quant on the 35B does NOT hold a single
+/// type across layers -- `ffn_down_exps` is Q5_K on 37 layers and Q6_K on 3 -- so this must be
+/// read per layer and carried alongside each layer's weights, never assumed from layer 0.
+/// Tasks 3 and 4 dispatch the fused Metal MoE kernel on this, per layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpertQuants {
+    pub gate: GgmlDType,
+    pub up: GgmlDType,
+    pub down: GgmlDType,
+}
+
+/// Quant types this loader knows how to handle for routed-expert weights. Anything else fails
+/// loudly at load time instead of silently mis-dequantizing.
+const SUPPORTED_EXPERT_QUANTS: [GgmlDType; 4] =
+    [GgmlDType::Q4K, GgmlDType::Q5K, GgmlDType::Q6K, GgmlDType::Q8_0];
+
+fn check_expert_quant(tensor_name: &str, dtype: GgmlDType) -> Result<GgmlDType> {
+    if SUPPORTED_EXPERT_QUANTS.contains(&dtype) {
+        Ok(dtype)
+    } else {
+        candle::bail!(
+            "unsupported expert quant type {dtype:?} on tensor {tensor_name}; expected one of \
+             {SUPPORTED_EXPERT_QUANTS:?}"
+        )
+    }
+}
+
+/// Read `{gate,up,down}` quant types for every MoE layer straight from a GGUF file's tensor
+/// table -- no dequantization, no full-tensor read, just the header. Exists so a loader that
+/// collapses per-layer quant types to a single one (e.g. layer 0's) can be caught in a test
+/// before the fused Metal kernel it feeds is written.
+pub fn read_expert_quants_per_layer<P: AsRef<std::path::Path>>(
+    path: P,
+) -> Result<Vec<ExpertQuants>> {
+    let mut file = std::fs::File::open(path.as_ref())?;
+    let ct = gguf_file::Content::read(&mut file)?;
+    let arch = match ct.metadata.get("general.architecture") {
+        Some(v) => v.to_string()?.clone(),
+        None => candle::bail!("cannot find general.architecture in metadata"),
+    };
+    let md_get = |s: &str| {
+        let keyed = s.replace("qwen3.", &format!("{arch}."));
+        match ct.metadata.get(s).or_else(|| ct.metadata.get(&keyed)) {
+            Some(v) => Ok(v),
+            None => candle::bail!("cannot find {s} or {keyed} in metadata"),
+        }
+    };
+    let num_layers = md_get("qwen3.block_count")?.to_u32()? as usize;
+
+    let mut out = Vec::with_capacity(num_layers);
+    for i in 0..num_layers {
+        let tensor_dtype = |suffix: &str| -> Result<GgmlDType> {
+            let name = format!("blk.{i}.{suffix}");
+            match ct.tensor_infos.get(&name) {
+                Some(info) => check_expert_quant(&name, info.ggml_dtype),
+                None => candle::bail!("missing tensor {name} in gguf tensor table"),
+            }
+        };
+        out.push(ExpertQuants {
+            gate: tensor_dtype("ffn_gate_exps.weight")?,
+            up: tensor_dtype("ffn_up_exps.weight")?,
+            down: tensor_dtype("ffn_down_exps.weight")?,
+        });
+    }
+    Ok(out)
+}
+
 /// Split a 3D stacked expert tensor `[n_experts, n_out, n_in]` into one `QMatMul` per expert.
 ///
 /// candle's quantized MoE path is CUDA-only: `candle_nn::moe::moe_gemm_gguf` bails on every other
@@ -142,6 +210,8 @@ struct MoeWeights {
     shared_up: QMatMul,
     shared_down: QMatMul,
     num_experts_per_tok: usize,
+    /// Quant types actually read off THIS layer's tensors, not assumed from another layer.
+    expert_quants: ExpertQuants,
 }
 
 impl MoeWeights {
@@ -155,12 +225,26 @@ impl MoeWeights {
             .tensor(&format!("{prefix}.ffn_gate_inp.weight"))?
             .dequantize(&device)?
             .to_dtype(DType::F32)?;
-        let gate_experts =
-            split_stacked_experts(&gg.tensor(&format!("{prefix}.ffn_gate_exps.weight"))?, &device)?;
-        let up_experts =
-            split_stacked_experts(&gg.tensor(&format!("{prefix}.ffn_up_exps.weight"))?, &device)?;
-        let down_experts =
-            split_stacked_experts(&gg.tensor(&format!("{prefix}.ffn_down_exps.weight"))?, &device)?;
+        let gate_exps_name = format!("{prefix}.ffn_gate_exps.weight");
+        let gate_exps_t = gg.tensor(&gate_exps_name)?;
+        let gate_dtype = check_expert_quant(&gate_exps_name, gate_exps_t.dtype())?;
+        let gate_experts = split_stacked_experts(&gate_exps_t, &device)?;
+
+        let up_exps_name = format!("{prefix}.ffn_up_exps.weight");
+        let up_exps_t = gg.tensor(&up_exps_name)?;
+        let up_dtype = check_expert_quant(&up_exps_name, up_exps_t.dtype())?;
+        let up_experts = split_stacked_experts(&up_exps_t, &device)?;
+
+        let down_exps_name = format!("{prefix}.ffn_down_exps.weight");
+        let down_exps_t = gg.tensor(&down_exps_name)?;
+        let down_dtype = check_expert_quant(&down_exps_name, down_exps_t.dtype())?;
+        let down_experts = split_stacked_experts(&down_exps_t, &device)?;
+
+        let expert_quants = ExpertQuants {
+            gate: gate_dtype,
+            up: up_dtype,
+            down: down_dtype,
+        };
 
         let shared_router = gg
             .tensor(&format!("{prefix}.ffn_gate_inp_shexp.weight"))?
@@ -183,7 +267,14 @@ impl MoeWeights {
             shared_up,
             shared_down,
             num_experts_per_tok,
+            expert_quants,
         })
+    }
+
+    /// The quant types this layer's routed-expert tensors were actually read as -- not layer 0's,
+    /// not a checkpoint-wide assumption. See [`ExpertQuants`].
+    fn expert_quants(&self) -> ExpertQuants {
+        self.expert_quants
     }
 
     fn expert_ffn(&self, e: usize, xs: &Tensor) -> Result<Tensor> {
@@ -1039,5 +1130,43 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The 35B's `ffn_down_exps` is unsloth's dynamic quant: Q5_K on 37 layers, Q6_K on 3. A
+    /// loader that reads the type once (e.g. from layer 0) and reuses it for all 40 layers will
+    /// report a single type here instead of two. The 14B rung cannot catch this -- it is plain
+    /// Q4_K_M/Q6_K with no per-layer variation -- so this test requires the 35B specifically.
+    ///
+    /// `QWEN36_35B_GGUF` is read at RUNTIME (`std::env::var`), not baked in via `env!` at compile
+    /// time: the test must not force a rebuild every time the checkpoint path changes, and must
+    /// not silently pass/skip when the variable or file is missing -- it fails loudly instead, as
+    /// a test that can silently skip is a test that can never fail.
+    #[test]
+    fn expert_quants_are_read_per_layer_not_once() {
+        let path = match std::env::var("QWEN36_35B_GGUF") {
+            Ok(path) => path,
+            Err(_) => panic!("QWEN36_35B_GGUF env var required for this test (35B GGUF path)"),
+        };
+        let path = std::path::Path::new(&path);
+        if !path.exists() {
+            panic!("35B GGUF required for this test: {}", path.display());
+        }
+        let quants = read_expert_quants_per_layer(path).unwrap();
+        assert_eq!(quants.len(), 40);
+
+        let downs: std::collections::HashSet<_> = quants.iter().map(|q| q.down).collect();
+        assert!(
+            downs.len() > 1,
+            "expected ffn_down_exps to carry MORE THAN ONE quant type across layers, got {downs:?} \
+             -- if this fails the loader is collapsing per-layer types"
+        );
+        assert_eq!(quants.iter().filter(|q| q.down == GgmlDType::Q6K).count(), 3);
+        assert_eq!(quants.iter().filter(|q| q.down == GgmlDType::Q5K).count(), 37);
+        assert!(quants.iter().all(|q| q.gate == GgmlDType::Q4K && q.up == GgmlDType::Q4K));
     }
 }
