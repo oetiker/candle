@@ -37,13 +37,36 @@ impl QMetalStorage {
     /// A borrow of `size` bytes at `offset` inside this storage's buffer, as a storage in its own
     /// right. No copy and no new allocation: the returned value keeps the same `Arc<Buffer>`.
     ///
-    /// `offset` must be 256-byte aligned. Metal only demands 4 on Apple silicon, but 256 is the
-    /// documented worst case for `setBuffer:offset:` and every expert stride this is used for
-    /// (Q4_K 589824 B, Q5_K 720896 B, Q6_K 860160 B) already satisfies it -- so requiring it
-    /// costs nothing and cannot produce a silently misaligned read on some other device.
+    /// `offset` must satisfy BOTH alignments, and they are independent:
+    ///
+    /// - 256 bytes, for Metal. Apple silicon only demands 4, but 256 is the documented worst case
+    ///   for `setBuffer:offset:`, so requiring it cannot produce a silently misaligned read on
+    ///   some other device.
+    /// - one whole block of `dtype`, for correctness. Every kernel here casts the base pointer to
+    ///   `block_qX *` and indexes in blocks, so an offset landing mid-block would reinterpret the
+    ///   tail of one block as the head of the next -- plausible numbers, no crash. The two
+    ///   alignments do not imply each other: Q6_K blocks are 210 bytes and gcd(210, 256) = 2, so
+    ///   an offset can be a clean multiple of 256 and still cut a block in half.
+    ///
+    /// `size` must likewise be a whole number of blocks, so the view can describe a shape at all.
     pub fn view(&self, offset: usize, size: usize) -> Result<Self> {
+        let type_size = self.dtype.type_size();
         if !offset.is_multiple_of(256) {
             crate::bail!("QMetalStorage::view offset {offset} is not 256-byte aligned")
+        }
+        if !offset.is_multiple_of(type_size) {
+            crate::bail!(
+                "QMetalStorage::view offset {offset} is not a whole number of {:?} blocks \
+                 ({type_size} bytes)",
+                self.dtype
+            )
+        }
+        if !size.is_multiple_of(type_size) {
+            crate::bail!(
+                "QMetalStorage::view size {size} is not a whole number of {:?} blocks \
+                 ({type_size} bytes)",
+                self.dtype
+            )
         }
         if offset + size > self.size {
             crate::bail!(

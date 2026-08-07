@@ -207,22 +207,33 @@ fn split_stacked_experts(t: &QTensor, device: &Device) -> Result<Vec<QMatMul>> {
         )
     }
 
+    // Decide the strategy ONCE, from the stride itself -- never by probing expert 0. Offset 0 is
+    // trivially aligned for every dtype, so a probe there always succeeds on Metal: it would make
+    // the copying fallback below dead code, and a stack whose stride is not alignable would then
+    // fail at expert 1 instead of quietly copying. `e * per_expert` is aligned for every e exactly
+    // when `per_expert` is, so this one test settles all of them.
+    let aliasable = per_expert.is_multiple_of(256) && per_expert.is_multiple_of(dtype.type_size());
+
     let mut out = Vec::with_capacity(n_experts);
-    if let Some(first) = t.byte_view(0, per_expert, (n_out, n_in))? {
-        out.push(QMatMul::from_weights(Arc::new(first))?);
-        for e in 1..n_experts {
-            let view = t
-                .byte_view(e * per_expert, per_expert, (n_out, n_in))?
-                .ok_or_else(|| {
-                    candle::Error::Msg(format!(
-                    "expert {e} of {n_experts} could not be aliased at byte {} though expert 0 \
-                     could; refusing to mix borrowed and copied experts",
-                    e * per_expert
-                ))
-                })?;
-            out.push(QMatMul::from_weights(Arc::new(view))?);
+    if aliasable {
+        // byte_view still returns None on non-Metal backends, which is the other way into the
+        // copying path.
+        let mut views = Vec::with_capacity(n_experts);
+        for e in 0..n_experts {
+            match t.byte_view(e * per_expert, per_expert, (n_out, n_in))? {
+                Some(view) => views.push(view),
+                None => {
+                    views.clear();
+                    break;
+                }
+            }
         }
-        return Ok(out);
+        if views.len() == n_experts {
+            for view in views {
+                out.push(QMatMul::from_weights(Arc::new(view))?);
+            }
+            return Ok(out);
+        }
     }
 
     let data = t.data()?;

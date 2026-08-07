@@ -815,9 +815,25 @@ impl QTensor {
         shape: S,
     ) -> Result<Option<Self>> {
         match &self.storage {
-            // 256 is the alignment QMetalStorage::view enforces; check it here too so an
-            // unalignable layout becomes a fallback rather than an error.
+            // 256 is one of the two alignments QMetalStorage::view enforces; check it here too so
+            // an unalignable layout becomes a fallback rather than an error. The block alignment
+            // is NOT downgraded to a fallback -- a mid-block offset is a caller bug, not a
+            // platform limitation, and it must not be papered over by silently copying.
             QStorage::Metal(s) if offset.is_multiple_of(256) => {
+                let shape: Shape = shape.into();
+                // QTensor::new only checks dims against block_size. Nothing else would notice a
+                // size that disagrees with the shape, and every kernel sizes its reads from the
+                // SHAPE -- so a short view would be read past its end.
+                let block_size = s.dtype().block_size();
+                let type_size = s.dtype().type_size();
+                let expected = shape.elem_count() / block_size * type_size;
+                if size_in_bytes != expected {
+                    crate::bail!(
+                        "QTensor::byte_view: {size_in_bytes} bytes do not describe {shape:?} of \
+                         {:?} ({expected} bytes)",
+                        s.dtype()
+                    )
+                }
                 let storage = QStorage::Metal(s.view(offset, size_in_bytes)?);
                 Ok(Some(Self::new(storage, shape)?))
             }

@@ -202,10 +202,32 @@ pub fn call_quantized_matmul_mv_id(
         GgmlDType::Q4_1 => "kernel_mul_mv_id_q4_1_f32",
         GgmlDType::Q5_0 => "kernel_mul_mv_id_q5_0_f32",
         GgmlDType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
-        GgmlDType::Q2K => "kernel_mul_mv_id_q2_K_f32",
         GgmlDType::Q3K => "kernel_mul_mv_id_q3_K_f32",
-        GgmlDType::F16 => "kernel_mul_mv_id_f16_f32",
-        GgmlDType::F32 => "kernel_mul_mv_id_f32_f32",
+        // Q2K is DELIBERATELY REFUSED even though kernel_mul_mv_id_q2_K_f32 exists.
+        // kernel_mul_mv_q2_K_f32_impl writes `(r0*N_SIMDGROUP + sgitg)*N_DST` = EIGHT rows per
+        // threadgroup (quantized.metal:4596) and, unlike the legacy quants at :2374 and :2551, it
+        // has no `first_row + row < ne01` guard on the store. mv_threadgroup_shape reports 4 for
+        // Q2K, so the dispatch launches twice the threadgroups needed and each one writes eight
+        // rows: for a plain mv_t the overrun lands past the end of a single output row (a latent
+        // out-of-bounds write that predates this function), but for mv_id the next expert slot is
+        // RIGHT THERE in the same dst buffer and gets clobbered. Measured: 2 of 6 slots wrong.
+        // Fixing it means correcting Q2K's entry in the shared threadgroup table, which changes
+        // call_quantized_matmul_mv_t for every existing caller -- out of scope here.
+        GgmlDType::Q2K => Err(MetalKernelError::UnsupportedDTypeForOp("Q2K", "mul_mv_id"))?,
+        // F16 and F32 are DELIBERATELY REFUSED even though kernel_mul_mv_id_{f16,f32}_f32 exist.
+        // They are the only instantiations that go through the nb-forwarding `mmv_fn` overload
+        // (quantized.metal:7489) into `kernel_mul_mv_impl`, and that kernel is shaped differently
+        // from every quantized one: `offset0 = r0*nb01` makes tgpig.x ONE output row, and
+        // `rb = tgpig.y*N_MV_T_T` makes tgpig.y a block of four src1 columns. So it needs both a
+        // real nb01 and a different grid (width ne01, height ne11/4) than
+        // `mv_threadgroup_shape` describes. Dispatching it on the quantized geometry with nb01=0
+        // would make every threadgroup read row 0 and silently return garbage.
+        //
+        // (call_quantized_matmul_mv_t has the same mismatch for these two types today. That is a
+        // pre-existing candle bug, not one introduced here, and fixing it is out of scope -- but
+        // it is why "just pass nb01" is not the fix for this function either.)
+        GgmlDType::F16 => Err(MetalKernelError::UnsupportedDTypeForOp("F16", "mul_mv_id"))?,
+        GgmlDType::F32 => Err(MetalKernelError::UnsupportedDTypeForOp("F32", "mul_mv_id"))?,
         GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "mul_mv_id"))?,
         GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "mul_mv_id"))?,
         GgmlDType::BF16 => Err(MetalKernelError::UnsupportedDTypeForOp("BF16", "mul_mv_id"))?,
@@ -262,8 +284,12 @@ pub fn call_quantized_matmul_mv_id(
             ne00,
             ne01,
             1i64, // ne02, forced to 1 inside the kernel
-            0u64, // nb00, unused by the k-quant impls
-            0u64, // nb01, ditto
+            // nb00/nb01 are dropped on the floor by the `mmv_fn` overload every dtype reaching
+            // here goes through (quantized.metal:7511): it forwards only ne*/r2/r3 to the
+            // impl. The one overload that DOES forward them serves f16/f32, which are refused
+            // above -- so 0 here is not "unused by k-quants", it is never read at all.
+            0u64,
+            0u64,
             nb02,
             ne00,           // ne10
             in_dim1 as i64, // ne11
