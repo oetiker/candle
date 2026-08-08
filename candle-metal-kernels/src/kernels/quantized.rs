@@ -5,7 +5,7 @@ use crate::{
 };
 use objc2_metal::MTLSize;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GgmlDType {
     Q4_0,
     Q4_1,
@@ -22,6 +22,47 @@ pub enum GgmlDType {
     F16,
     F32,
     BF16,
+}
+
+/// Stable short label for error messages, kept as an explicit match (not `Debug`) so the exact
+/// strings `mul_mv_id`/`mul_mm_id` error messages have always used stay stable across refactors.
+fn dtype_label(dtype: GgmlDType) -> &'static str {
+    match dtype {
+        GgmlDType::Q4_0 => "Q4_0",
+        GgmlDType::Q4_1 => "Q4_1",
+        GgmlDType::Q5_0 => "Q5_0",
+        GgmlDType::Q5_1 => "Q5_1",
+        GgmlDType::Q8_0 => "Q8_0",
+        GgmlDType::Q8_1 => "Q8_1",
+        GgmlDType::Q2K => "Q2K",
+        GgmlDType::Q3K => "Q3K",
+        GgmlDType::Q4K => "Q4K",
+        GgmlDType::Q5K => "Q5K",
+        GgmlDType::Q6K => "Q6K",
+        GgmlDType::Q8K => "Q8K",
+        GgmlDType::F16 => "F16",
+        GgmlDType::F32 => "F32",
+        GgmlDType::BF16 => "BF16",
+    }
+}
+
+/// Look `dtype` up in `allowed` (an explicit `(dtype, kernel_name)` allow-list) or refuse it for
+/// `op`. Shared by `mul_mv_id` and `mul_mm_id` so their dtype dispatch is the same
+/// lookup-or-refuse shape instead of two independently hand-typed matches over all 15
+/// `GgmlDType` variants -- the two functions' allow-lists genuinely differ (`mul_mv_id`
+/// additionally supports the legacy quants and Q3K; `mul_mm_id` is restricted to the four
+/// `SUPPORTED_EXPERT_QUANTS` types), so this takes the list as a parameter rather than hardcoding
+/// one.
+fn require_supported_dtype(
+    dtype: GgmlDType,
+    allowed: &[(GgmlDType, &'static str)],
+    op: &'static str,
+) -> Result<&'static str, MetalKernelError> {
+    allowed
+        .iter()
+        .find(|(d, _)| *d == dtype)
+        .map(|(_, name)| *name)
+        .ok_or_else(|| MetalKernelError::UnsupportedDTypeForOp(dtype_label(dtype), op))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -193,45 +234,40 @@ pub fn call_quantized_matmul_mv_id(
     dst: &Buffer,
     dst_offset: usize,
 ) -> Result<(), MetalKernelError> {
-    let name = match dtype {
-        GgmlDType::Q4K => "kernel_mul_mv_id_q4_K_f32",
-        GgmlDType::Q5K => "kernel_mul_mv_id_q5_K_f32",
-        GgmlDType::Q6K => "kernel_mul_mv_id_q6_K_f32",
-        GgmlDType::Q8_0 => "kernel_mul_mv_id_q8_0_f32",
-        GgmlDType::Q4_0 => "kernel_mul_mv_id_q4_0_f32",
-        GgmlDType::Q4_1 => "kernel_mul_mv_id_q4_1_f32",
-        GgmlDType::Q5_0 => "kernel_mul_mv_id_q5_0_f32",
-        GgmlDType::Q5_1 => "kernel_mul_mv_id_q5_1_f32",
-        GgmlDType::Q3K => "kernel_mul_mv_id_q3_K_f32",
-        // Q2K is DELIBERATELY REFUSED even though kernel_mul_mv_id_q2_K_f32 exists.
-        // kernel_mul_mv_q2_K_f32_impl writes `(r0*N_SIMDGROUP + sgitg)*N_DST` = EIGHT rows per
-        // threadgroup (quantized.metal:4596) and, unlike the legacy quants at :2374 and :2551, it
-        // has no `first_row + row < ne01` guard on the store. mv_threadgroup_shape reports 4 for
-        // Q2K, so the dispatch launches twice the threadgroups needed and each one writes eight
-        // rows: for a plain mv_t the overrun lands past the end of a single output row (a latent
-        // out-of-bounds write that predates this function), but for mv_id the next expert slot is
-        // RIGHT THERE in the same dst buffer and gets clobbered. Measured: 2 of 6 slots wrong.
-        // Fixing it means correcting Q2K's entry in the shared threadgroup table, which changes
-        // call_quantized_matmul_mv_t for every existing caller -- out of scope here.
-        GgmlDType::Q2K => Err(MetalKernelError::UnsupportedDTypeForOp("Q2K", "mul_mv_id"))?,
-        // F16 and F32 are DELIBERATELY REFUSED even though kernel_mul_mv_id_{f16,f32}_f32 exist.
-        // They are the only instantiations that go through the nb-forwarding `mmv_fn` overload
-        // (quantized.metal:7489) into `kernel_mul_mv_impl`, and that kernel is shaped differently
-        // from every quantized one: `offset0 = r0*nb01` makes tgpig.x ONE output row, and
-        // `rb = tgpig.y*N_MV_T_T` makes tgpig.y a block of four src1 columns. So it needs both a
-        // real nb01 and a different grid (width ne01, height ne11/4) than
-        // `mv_threadgroup_shape` describes. Dispatching it on the quantized geometry with nb01=0
-        // would make every threadgroup read row 0 and silently return garbage.
-        //
-        // (call_quantized_matmul_mv_t has the same mismatch for these two types today. That is a
-        // pre-existing candle bug, not one introduced here, and fixing it is out of scope -- but
-        // it is why "just pass nb01" is not the fix for this function either.)
-        GgmlDType::F16 => Err(MetalKernelError::UnsupportedDTypeForOp("F16", "mul_mv_id"))?,
-        GgmlDType::F32 => Err(MetalKernelError::UnsupportedDTypeForOp("F32", "mul_mv_id"))?,
-        GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "mul_mv_id"))?,
-        GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "mul_mv_id"))?,
-        GgmlDType::BF16 => Err(MetalKernelError::UnsupportedDTypeForOp("BF16", "mul_mv_id"))?,
-    };
+    // Q2K, F16, F32, Q8_1, Q8K, BF16 are DELIBERATELY excluded from this allow-list, even though
+    // `kernel_mul_mv_id_{q2_K,f16,f32}_f32` exist:
+    //
+    // - Q2K: `kernel_mul_mv_q2_K_f32_impl` writes `(r0*N_SIMDGROUP + sgitg)*N_DST` = EIGHT rows
+    //   per threadgroup (quantized.metal:4596) and, unlike the legacy quants at :2374 and :2551,
+    //   has no `first_row + row < ne01` guard on the store. `mv_threadgroup_shape` reports 4 for
+    //   Q2K, so the dispatch launches twice the threadgroups needed and each one writes eight
+    //   rows: for a plain mv_t the overrun lands past the end of a single output row (a latent
+    //   out-of-bounds write that predates this function), but for mv_id the next expert slot is
+    //   RIGHT THERE in the same dst buffer and gets clobbered. Measured: 2 of 6 slots wrong.
+    //   Fixing it means correcting Q2K's entry in the shared threadgroup table, which changes
+    //   `call_quantized_matmul_mv_t` for every existing caller -- out of scope here.
+    // - F16, F32: the only instantiations that go through the nb-forwarding `mmv_fn` overload
+    //   (quantized.metal:7489) into `kernel_mul_mv_impl`, shaped differently from every quantized
+    //   one: `offset0 = r0*nb01` makes tgpig.x ONE output row, and `rb = tgpig.y*N_MV_T_T` makes
+    //   tgpig.y a block of four src1 columns. So it needs both a real nb01 and a different grid
+    //   (width ne01, height ne11/4) than `mv_threadgroup_shape` describes. Dispatching it on the
+    //   quantized geometry with nb01=0 would make every threadgroup read row 0 and silently
+    //   return garbage. (`call_quantized_matmul_mv_t` has the same mismatch for these two types
+    //   today -- a pre-existing candle bug, not one introduced here, and out of scope to fix, but
+    //   why "just pass nb01" is not the fix for this function either.)
+    // - Q8_1, Q8K: no `_id` kernel instantiation exists for these at all.
+    const MUL_MV_ID_SUPPORTED: &[(GgmlDType, &str)] = &[
+        (GgmlDType::Q4K, "kernel_mul_mv_id_q4_K_f32"),
+        (GgmlDType::Q5K, "kernel_mul_mv_id_q5_K_f32"),
+        (GgmlDType::Q6K, "kernel_mul_mv_id_q6_K_f32"),
+        (GgmlDType::Q8_0, "kernel_mul_mv_id_q8_0_f32"),
+        (GgmlDType::Q4_0, "kernel_mul_mv_id_q4_0_f32"),
+        (GgmlDType::Q4_1, "kernel_mul_mv_id_q4_1_f32"),
+        (GgmlDType::Q5_0, "kernel_mul_mv_id_q5_0_f32"),
+        (GgmlDType::Q5_1, "kernel_mul_mv_id_q5_1_f32"),
+        (GgmlDType::Q3K, "kernel_mul_mv_id_q3_K_f32"),
+    ];
+    let name = require_supported_dtype(dtype, MUL_MV_ID_SUPPORTED, "mul_mv_id")?;
     if n_experts == 0 {
         return Err(MetalKernelError::InvalidInput(
             "mul_mv_id: expert stack is empty".to_string(),
@@ -324,6 +360,31 @@ pub fn call_quantized_matmul_mv_id(
     Ok(())
 }
 
+/// The largest `topk * batch` (ggml's `dst_rows`) a single `mul_mm_id` dispatch can hold in
+/// `device`'s threadgroup memory. SINGLE SOURCE OF TRUTH for this formula: it must be called from
+/// both [`call_quantized_matmul_mm_id`]'s hard-reject check below AND from the caller that sizes
+/// chunks against it (`QMetalStorage::indexed_moe_forward` in candle-core) -- this used to be the
+/// same expression typed out at both sites, and a silent drift between them (say, one site's
+/// constant changing without the other's) would have let the caller size a chunk the callee then
+/// rejects, or worse, would have needed BOTH sites to indepedently stay correct for a hard
+/// hardware ceiling never to be exceeded.
+///
+/// Ported directly from ggml's own host-side gate for this kernel (`ggml-metal.m` circa candle's
+/// vendor point `611aa914e^`: `dst_rows_max = (device.maxThreadgroupMemoryLength/2 - 8192)/4`),
+/// not independently derived. Of its three constants, two are read straight off the kernel body:
+/// `8192` is `kernel_mul_mm_id`'s fixed simdgroup-matrix staging area in bytes, and `4` is
+/// `sizeof(ushort2)`, the size of one `rowids` entry. The leading `/ 2`, however, is NOT explained
+/// anywhere in ggml's source or derived by this port -- it is an unexplained safety margin,
+/// inherited as-is. It only makes the bound MORE conservative (a smaller `dst_rows_max` can cause
+/// this function to refuse a batch that would in fact have fit in threadgroup memory, never
+/// accept one that overflows it), so carrying it forward un-investigated is safe, just not fully
+/// understood.
+pub fn mul_mm_id_dst_rows_max(device: &Device) -> usize {
+    use objc2_metal::MTLDevice as _;
+    let max_tg_mem = device.as_ref().maxThreadgroupMemoryLength();
+    (max_tg_mem / 2).saturating_sub(8192) / 4
+}
+
 /// Fused MoE matrix-MATRIX (prefill): ggml's `kernel_mul_mm_id`, a tiled simdgroup-matrix kernel
 /// that -- unlike `mul_mv_id`'s one-threadgroup-per-output-row scheme -- amortizes each 64-row
 /// tile of an expert's weights over up to 32 (token, slot) pairs at once. Grid depth is
@@ -381,31 +442,28 @@ pub fn call_quantized_matmul_mm_id(
     dst: &Buffer,
     dst_offset: usize,
 ) -> Result<(), MetalKernelError> {
-    let name = match dtype {
-        GgmlDType::Q4K => "kernel_mul_mm_id_q4_K_f32",
-        GgmlDType::Q5K => "kernel_mul_mm_id_q5_K_f32",
-        GgmlDType::Q6K => "kernel_mul_mm_id_q6_K_f32",
-        GgmlDType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
-        // Every other instantiation is refused here even though `kernel_mul_mm_id_*` exists for
-        // most of them (see the f32/f16/id_bf16/legacy-quant/iq* template list in
-        // quantized.metal). Not because any of them is known-hazardous the way Q2K's `mv_id` is
-        // (see that refusal below): BLOCK_SIZE_M/N/K here are `#define`s shared by every dtype's
-        // `kernel_mul_mm_id` instantiation (quantized.metal:6984-6991), not a Rust-side
-        // per-dtype table a type can silently fall through the cracks of. This is purely "the
-        // model loader's SUPPORTED_EXPERT_QUANTS already promises only these four reach here, so
-        // this match is defense in depth, not a live decision."
-        GgmlDType::Q2K => Err(MetalKernelError::UnsupportedDTypeForOp("Q2K", "mul_mm_id"))?,
-        GgmlDType::F16 => Err(MetalKernelError::UnsupportedDTypeForOp("F16", "mul_mm_id"))?,
-        GgmlDType::F32 => Err(MetalKernelError::UnsupportedDTypeForOp("F32", "mul_mm_id"))?,
-        GgmlDType::BF16 => Err(MetalKernelError::UnsupportedDTypeForOp("BF16", "mul_mm_id"))?,
-        GgmlDType::Q3K => Err(MetalKernelError::UnsupportedDTypeForOp("Q3K", "mul_mm_id"))?,
-        GgmlDType::Q4_0 => Err(MetalKernelError::UnsupportedDTypeForOp("Q4_0", "mul_mm_id"))?,
-        GgmlDType::Q4_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q4_1", "mul_mm_id"))?,
-        GgmlDType::Q5_0 => Err(MetalKernelError::UnsupportedDTypeForOp("Q5_0", "mul_mm_id"))?,
-        GgmlDType::Q5_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q5_1", "mul_mm_id"))?,
-        GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "mul_mm_id"))?,
-        GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "mul_mm_id"))?,
-    };
+    // Every dtype other than these four is refused here even though `kernel_mul_mm_id_*` exists
+    // for most of them (see the f32/f16/bf16/legacy-quant/iq* template list in quantized.metal).
+    //
+    // UNLIKE `mul_mv_id`'s Q2K refusal above, this restriction is PRECAUTIONARY, not
+    // load-bearing: confirmed by reading the shader, every `kernel_mul_mm_id_*` instantiation --
+    // for every dtype, not just these four -- routes through the SAME shared
+    // `kernel_mul_mm_id_impl` (quantized.metal:7145), templated only on block type and
+    // dequantize function, with global `BLOCK_SIZE_M/N/K` `#define`s (quantized.metal:6984-6991)
+    // it cannot diverge from per-dtype. That is structurally different from `mul_mv_id`, where
+    // each dtype has its own kernel body and Q2K's row-writing genuinely diverged from what the
+    // Rust-side `mv_threadgroup_shape` table promised. So the Q2K-style store-guard hazard class
+    // CANNOT apply to `mul_mm_id` for any dtype -- a future reader should not assume it does.
+    // This match exists purely because the model loader's `SUPPORTED_EXPERT_QUANTS` already
+    // promises only these four reach here, so keeping this in sync is defense in depth, not a
+    // live safety decision the way the `mul_mv_id` list above is.
+    const MUL_MM_ID_SUPPORTED: &[(GgmlDType, &str)] = &[
+        (GgmlDType::Q4K, "kernel_mul_mm_id_q4_K_f32"),
+        (GgmlDType::Q5K, "kernel_mul_mm_id_q5_K_f32"),
+        (GgmlDType::Q6K, "kernel_mul_mm_id_q6_K_f32"),
+        (GgmlDType::Q8_0, "kernel_mul_mm_id_q8_0_f32"),
+    ];
+    let name = require_supported_dtype(dtype, MUL_MM_ID_SUPPORTED, "mul_mm_id")?;
     if n_experts == 0 {
         return Err(MetalKernelError::InvalidInput(
             "mul_mm_id: expert stack is empty".to_string(),
@@ -425,14 +483,13 @@ pub fn call_quantized_matmul_mm_id(
     }
 
     let dst_rows = topk * batch;
-    // SAFETY/CORRECTNESS: not a tuning knob. See the threadgroup-memory discussion on this
-    // function's doc comment.
-    let max_tg_mem = {
-        use objc2_metal::MTLDevice as _;
-        device.as_ref().maxThreadgroupMemoryLength()
-    };
-    let dst_rows_max = (max_tg_mem / 2).saturating_sub(8192) / 4;
+    // SAFETY/CORRECTNESS: not a tuning knob. See `mul_mm_id_dst_rows_max`'s doc comment.
+    let dst_rows_max = mul_mm_id_dst_rows_max(device);
     if dst_rows > dst_rows_max {
+        let max_tg_mem = {
+            use objc2_metal::MTLDevice as _;
+            device.as_ref().maxThreadgroupMemoryLength()
+        };
         return Err(MetalKernelError::InvalidInput(format!(
             "mul_mm_id {name}: topk*batch {dst_rows} exceeds this device's dst_rows_max \
              {dst_rows_max} (maxThreadgroupMemoryLength {max_tg_mem} bytes); caller must chunk \

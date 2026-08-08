@@ -618,15 +618,15 @@ impl QMetalStorage {
         } else {
             // Prefill: `mul_mm_id`'s tiled simdgroup-matrix kernel, chunked along the token axis
             // so `topk * chunk` never exceeds what Metal's threadgroup memory can hold for the
-            // kernel's `rowids` scratch array. See `call_quantized_matmul_mm_id`'s doc comment --
-            // this is not a tuning choice, dispatching the whole prompt in one call is a hard
-            // failure on real hardware (5304 tokens * topk=8 is ~20x the ~2048-row budget on an
-            // M1 Max's 32768-byte maxThreadgroupMemoryLength).
-            let max_tg_mem = {
-                use objc2_metal::MTLDevice as _;
-                device.device().as_ref().maxThreadgroupMemoryLength()
-            };
-            let dst_rows_max = (max_tg_mem / 2).saturating_sub(8192) / 4;
+            // kernel's `rowids` scratch array. This is not a tuning choice: dispatching the whole
+            // prompt in one call is a hard failure on real hardware (5304 tokens * topk=8 is ~20x
+            // the ~2048-row budget on an M1 Max's 32768-byte maxThreadgroupMemoryLength).
+            //
+            // `mul_mm_id_dst_rows_max` (candle-metal-kernels) is the SINGLE SOURCE OF TRUTH for
+            // this ceiling -- `call_quantized_matmul_mm_id` calls the exact same function for its
+            // own hard-reject check below. Do not re-derive this formula here: a second, drifted
+            // copy would let this site size a chunk the callee then rejects.
+            let dst_rows_max = candle_metal_kernels::mul_mm_id_dst_rows_max(device.device());
             // Chunk size is capped at 32, NOT maximized to `dst_rows_max`, for a reason that is
             // about correctness-in-practice rather than tuning: `kernel_mul_mm_id`'s row-id
             // collection ("// TODO: parallelize this loop" in quantized.metal, ggml's own words)
@@ -634,14 +634,21 @@ impl QMetalStorage {
             // `chunk * topk` ids -- and every one of `n_experts` dispatched threadgroups per tile
             // pays that scan even when it finds no rows for its expert. That cost is
             // O(chunk^2 * n_experts): linear in chunk from the scan length, another linear factor
-            // from grid width (`divide(chunk, 32)`) scaling with chunk too. At the 256-expert 35B,
-            // chunk = dst_rows_max/topk = 256 measured as indistinguishable from a GPU hang (killed
-            // after 20+ min of no progress); chunk = 32 measured a real 68s for the whole
-            // 5304-token prefill, chunk = 64 measured 77s (worse despite half the dispatch count,
-            // consistent with the quadratic term dominating already). 32 is conservative, not
-            // tuned -- Task 10 owns finding the actual optimum, and may find ggml's own
-            // dst_rows-worth-it heuristic (`dst_rows > n_as`) or a parallel row-id scan changes
-            // this entirely.
+            // from grid width (`divide(chunk, 32)`) scaling with chunk too, AND linear in
+            // `n_experts` directly since every expert's threadgroup pays the scan regardless of
+            // whether it collects any rows.
+            //
+            // 32 is an EMPIRICAL FLOOR, not a derived safe value, and it is bounded ONLY for the
+            // exact configuration it was measured on: 256 experts, topk=8, on an M1 Max, with a
+            // 5304-token prompt. At that configuration: chunk = dst_rows_max/topk = 256 measured
+            // indistinguishable from a GPU hang (killed after 20+ min of no progress); chunk = 64
+            // measured 77s; chunk = 32 measured a real 68s for the whole prefill. Since the scan
+            // cost scales with `n_experts` independently of `chunk`, a checkpoint with
+            // MEANINGFULLY MORE EXPERTS OR A LARGER TOPK than this one could reintroduce
+            // hang-like wall-clock even at chunk=32 -- this constant has not been re-validated
+            // against any other configuration. Do not retune it (Task 10's concern); if it needs
+            // to change, re-measure at the new configuration rather than assuming the old
+            // measurement still holds.
             let max_batch_per_dispatch = (dst_rows_max / topk).clamp(1, 32);
 
             let in_row_bytes = in_dim1 * k * DType::F32.size_in_bytes();
