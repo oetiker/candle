@@ -31,7 +31,13 @@
 
 use candle::{DType, Result, Tensor, D};
 
-const CHUNK_SIZE: usize = 64;
+/// Tokens per chunk of the parallel scan.
+///
+/// Public because it is not merely an implementation detail for a caller that splits a prefill:
+/// two forwards that meet on a multiple of `CHUNK_SIZE` see exactly the same chunk partition as
+/// one undivided forward, so their arithmetic — and hence their token ids — agree exactly. Split
+/// anywhere else and the results are still correct, but no longer bit-identical to a single pass.
+pub const CHUNK_SIZE: usize = 64;
 
 /// Pure-Candle chunked GatedDeltaNet for prefill (t > 1).
 ///

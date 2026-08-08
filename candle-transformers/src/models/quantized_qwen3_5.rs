@@ -971,12 +971,27 @@ impl GatedDeltaNetWeights {
         let b = self.in_proj_b.forward(hidden_states)?;
         let a = self.in_proj_a.forward(hidden_states)?;
 
-        let use_precomputed_states = self.conv_state.is_some() && seq_len == 1;
+        // Continue from carried state whenever there IS carried state -- for ANY seq_len, not
+        // only seq_len == 1. The old `&& seq_len == 1` silently DISCARDED both the conv window
+        // and the recurrent state on a multi-token forward, so a forward that resumed a partly
+        // consumed prompt restarted the recurrence from zero and produced fluent, wrong output.
+        // That made `--prefill-chunk N` (N > 1, N < prompt_len) wrong, and it blocks any prompt
+        // cache: restoring a snapshot is worthless if the next multi-token forward throws it away.
+        //
+        // Both branches below generalise without further change:
+        //   conv: cat([state (k-1 cols), qkv (seq_len cols)]) is k-1+seq_len wide, so a conv1d
+        //         with kernel k emits exactly seq_len columns, and the next state is the LAST
+        //         k-1 columns -- narrow(2, seq_len, k-1), which reduces to the old
+        //         narrow(2, 1, k-1) when seq_len == 1.
+        //   recurrent: gated_delta_rule_chunked already seeds its running state from the
+        //         `state` argument (`let mut s = state.clone()`), so a non-zero initial state
+        //         propagates correctly through the chunked scan.
+        let use_precomputed_states = self.conv_state.is_some();
 
         let mixed_qkv = if use_precomputed_states {
             let conv_state = self.conv_state.as_mut().unwrap();
             let conv_state_data = Tensor::cat(&[conv_state, &mixed_qkv], 2)?;
-            *conv_state = conv_state_data.narrow(2, 1, self.conv_kernel_size - 1)?;
+            *conv_state = conv_state_data.narrow(2, seq_len, self.conv_kernel_size - 1)?;
             let out = conv_state_data.conv1d(&self.conv1d_weight, 0, 1, 1, self.conv_dim)?;
             candle_nn::ops::silu(&out)?
         } else {
@@ -1192,6 +1207,65 @@ impl LayerWeights {
     }
 }
 
+/// The whole inference state of one layer — everything that makes a forward depend on the tokens
+/// already consumed.
+///
+/// Qwen3.6 mixes two kinds, and they behave very differently under caching:
+/// - [`LayerState::Kv`] grows linearly with context (10 of 40 layers here).
+/// - [`LayerState::Delta`] is a FIXED-SIZE recurrent state (30 of 40). It is also not invertible:
+///   a delta state cannot be truncated back to a shorter prefix the way a KV cache can be sliced,
+///   so a cached prefix has to match exactly — there is no partial rewind.
+///
+/// The tensors are handed over as-is. [`ModelWeights::layer_states`] returns handles that SHARE
+/// storage with the model, so a caller keeping a snapshot across forwards must deep-copy them
+/// (`Tensor::copy`) rather than assume candle will never gain an in-place cache kernel.
+#[derive(Debug, Clone)]
+pub enum LayerState {
+    /// Full-attention layer: the concatenated K and V, `None` while the cache is empty.
+    Kv {
+        k: Option<Tensor>,
+        v: Option<Tensor>,
+    },
+    /// GatedDeltaNet layer: the causal-conv window and the recurrent state.
+    Delta {
+        conv: Option<Tensor>,
+        recurrent: Option<Tensor>,
+    },
+}
+
+impl LayerState {
+    /// Total bytes of the tensors held, so a caller can report a snapshot's real size instead of
+    /// predicting it from the config.
+    pub fn size_in_bytes(&self) -> usize {
+        let t = |o: &Option<Tensor>| {
+            o.as_ref()
+                .map(|t| t.elem_count() * t.dtype().size_in_bytes())
+                .unwrap_or(0)
+        };
+        match self {
+            Self::Kv { k, v } => t(k) + t(v),
+            Self::Delta { conv, recurrent } => t(conv) + t(recurrent),
+        }
+    }
+
+    /// A copy that shares NO storage with `self`.
+    pub fn deep_copy(&self) -> Result<Self> {
+        let c = |o: &Option<Tensor>| -> Result<Option<Tensor>> {
+            match o {
+                None => Ok(None),
+                Some(t) => Ok(Some(t.copy()?)),
+            }
+        };
+        Ok(match self {
+            Self::Kv { k, v } => Self::Kv { k: c(k)?, v: c(v)? },
+            Self::Delta { conv, recurrent } => Self::Delta {
+                conv: c(conv)?,
+                recurrent: c(recurrent)?,
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelWeights {
     embed_tokens: Embedding,
@@ -1364,6 +1438,61 @@ impl ModelWeights {
         for layer in &mut self.layers {
             layer.clear_kv_cache();
         }
+    }
+
+    /// Every layer's inference state, in layer order.
+    ///
+    /// The tensors SHARE storage with the model — this is a borrow made owned, not a copy. Use
+    /// [`LayerState::deep_copy`] on the result to keep a snapshot that survives later forwards.
+    pub fn layer_states(&self) -> Vec<LayerState> {
+        self.layers
+            .iter()
+            .map(|layer| match &layer.token_mixer {
+                TokenMixer::FullAttention(attn) => LayerState::Kv {
+                    k: attn.kv_cache.k().cloned(),
+                    v: attn.kv_cache.v().cloned(),
+                },
+                TokenMixer::LinearAttention(attn) => LayerState::Delta {
+                    conv: attn.conv_state.clone(),
+                    recurrent: attn.recurrent_state.clone(),
+                },
+            })
+            .collect()
+    }
+
+    /// Overwrite every layer's inference state.
+    ///
+    /// The tensors are installed AS GIVEN. A caller that intends to restore the same states again
+    /// later must pass deep copies, or the model and the snapshot would share storage.
+    ///
+    /// Errors if the states do not match the model layer-for-layer: a Kv state landing on a
+    /// GatedDeltaNet layer is a caller bug that would otherwise corrupt generation silently.
+    pub fn set_layer_states(&mut self, states: &[LayerState]) -> Result<()> {
+        if states.len() != self.layers.len() {
+            candle::bail!(
+                "state has {} layers, model has {}",
+                states.len(),
+                self.layers.len()
+            );
+        }
+        for (i, (layer, state)) in self.layers.iter_mut().zip(states).enumerate() {
+            match (&mut layer.token_mixer, state) {
+                (TokenMixer::FullAttention(attn), LayerState::Kv { k, v }) => {
+                    attn.kv_cache.reset();
+                    if let (Some(k), Some(v)) = (k, v) {
+                        // append() on a just-reset cache stores k/v directly (there is nothing to
+                        // concatenate with), so this is a set, not a growth step.
+                        attn.kv_cache.append(k, v)?;
+                    }
+                }
+                (TokenMixer::LinearAttention(attn), LayerState::Delta { conv, recurrent }) => {
+                    attn.conv_state = conv.clone();
+                    attn.recurrent_state = recurrent.clone();
+                }
+                _ => candle::bail!("layer {i}: state kind does not match the model's layer kind"),
+            }
+        }
+        Ok(())
     }
 }
 
