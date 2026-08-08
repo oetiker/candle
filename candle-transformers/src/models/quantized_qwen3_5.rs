@@ -151,22 +151,28 @@ pub fn read_expert_quants_per_layer<P: AsRef<std::path::Path>>(
     Ok(out)
 }
 
-/// How the routed experts are evaluated.
+/// How the routed experts are evaluated, for ONE phase (prefill or decode -- see [`MoeModes`]).
 ///
 /// Chosen at load time, not per call, because it decides what gets built: `Fused` needs the
-/// stacked `[n_experts, n_out, n_in]` tensor the `mul_mv_id` kernel indexes into, `Loop` needs
-/// only the per-expert 2-D matrices. Both are always available once loaded (the per-expert
-/// matrices are views into the stack, see [`split_stacked_experts`]), so the switch costs nothing
-/// but keeps `Loop` byte-for-byte the path the llama.cpp gate was closed against.
+/// stacked `[n_experts, n_out, n_in]` tensor the fused kernels index into, `Loop` needs only the
+/// per-expert 2-D matrices. Both are always available once loaded (the per-expert matrices are
+/// views into the stack, see [`split_stacked_experts`]), so the switch costs nothing but keeps
+/// `Loop` byte-for-byte the path the llama.cpp gate was closed against.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MoeMode {
     /// Group tokens by expert on the host and issue one plain quantized matmul per non-empty
     /// group. Correct everywhere; the reference path the llama.cpp gate was closed against.
     #[default]
     Loop,
-    /// Every token count goes through a fused Metal kernel: no host readback of the routing, no
-    /// per-expert dispatch. Decode (one token) uses `mul_mv_id`; prefill (many tokens) uses
-    /// `mul_mm_id`, chosen inside `QMetalStorage::indexed_moe_forward` by `batch == 1`.
+    /// A fused Metal kernel: no host readback of the routing, no per-expert dispatch. Decode
+    /// (`batch == 1`) uses `mul_mv_id`; prefill (`batch > 1`) uses `mul_mm_id`, chunked. Measured
+    /// (Task 4, 35B/256 experts, 5304-token prompt): `mul_mv_id` at decode is a clear win
+    /// (3.04 -> 11.77 tok/s over `Loop`, Task 3), but `mul_mm_id` at prefill is a REGRESSION
+    /// versus `Loop` (78.0 vs 118.3 tok/s measured on the identical prompt) -- ggml's own
+    /// `kernel_mul_mm_id` pays an unparallelized O(chunk^2 * n_experts) row-id scan that `Loop`'s
+    /// one-matmul-per-expert amortizes away on a long prompt. So `Fused` is not a strict win per
+    /// phase; [`MoeModes`] exists so a caller can pick `Fused` for decode and `Loop` for prefill
+    /// independently, which is the configuration this measurement recommends.
     Fused,
 }
 
@@ -178,6 +184,31 @@ impl std::str::FromStr for MoeMode {
             "fused" => Ok(Self::Fused),
             other => candle::bail!("unknown MoE mode {other}, expected `loop` or `fused`"),
         }
+    }
+}
+
+/// [`MoeMode`], independently, for prefill (`batch > 1`) and decode (`batch == 1`).
+///
+/// A LOAD-time choice, like `MoeMode` itself: the stacked expert tensors `Fused` needs are built
+/// once if EITHER phase asks for `Fused`, and both phases share them (the per-expert `QMatMul`s
+/// are views into the same stack regardless of which phase, if any, uses `Fused`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct MoeModes {
+    pub prefill: MoeMode,
+    pub decode: MoeMode,
+}
+
+impl MoeModes {
+    /// Both phases the same mode -- what a bare `--moe loop|fused` means.
+    pub fn both(mode: MoeMode) -> Self {
+        Self {
+            prefill: mode,
+            decode: mode,
+        }
+    }
+
+    fn any_fused(self) -> bool {
+        self.prefill == MoeMode::Fused || self.decode == MoeMode::Fused
     }
 }
 
@@ -279,12 +310,13 @@ pub struct MoeWeights {
     num_experts_per_tok: usize,
     /// Quant types actually read off THIS layer's tensors, not assumed from another layer.
     expert_quants: ExpertQuants,
-    /// The undivided `[n_experts, n_out, n_in]` stacks, kept only for [`MoeMode::Fused`]: the
-    /// `mul_mv_id` kernel addresses experts as `base + expert_id * stride`, which needs one
-    /// allocation. The per-expert `QMatMul`s above are views into these, so holding both costs
-    /// no extra memory.
+    /// The undivided `[n_experts, n_out, n_in]` stacks, kept if EITHER phase asks for
+    /// [`MoeMode::Fused`]: the fused kernels address experts as `base + expert_id * stride`,
+    /// which needs one allocation. The per-expert `QMatMul`s above are views into these, so
+    /// holding both costs no extra memory.
     stacked: Option<StackedExperts>,
-    mode: MoeMode,
+    prefill_mode: MoeMode,
+    decode_mode: MoeMode,
 }
 
 /// The three routed-expert weight stacks, undivided.
@@ -300,7 +332,7 @@ impl MoeWeights {
         gg: &mut Gguf<R>,
         prefix: &str,
         num_experts_per_tok: usize,
-        mode: MoeMode,
+        modes: MoeModes,
     ) -> Result<Self> {
         let device = gg.device.clone();
         let router = gg
@@ -328,13 +360,14 @@ impl MoeWeights {
             down: down_dtype,
         };
 
-        let stacked = match mode {
-            MoeMode::Loop => None,
-            MoeMode::Fused => Some(StackedExperts {
+        let stacked = if modes.any_fused() {
+            Some(StackedExperts {
                 gate: Arc::new(gate_exps_t),
                 up: Arc::new(up_exps_t),
                 down: Arc::new(down_exps_t),
-            }),
+            })
+        } else {
+            None
         };
 
         let shared_router = gg
@@ -360,7 +393,8 @@ impl MoeWeights {
             num_experts_per_tok,
             expert_quants,
             stacked,
-            mode,
+            prefill_mode: modes.prefill,
+            decode_mode: modes.decode,
         })
     }
 
@@ -493,9 +527,19 @@ impl Module for MoeWeights {
 
         let (topk_ids, weights) = self.route(&xs)?;
 
-        // Fused covers both decode and prefill now: `QMetalStorage::indexed_moe_forward` picks
-        // `mul_mv_id` vs `mul_mm_id` (and, for `mul_mm_id`, chunks the token axis) internally.
-        let out = match (self.mode, self.stacked.as_ref()) {
+        // Phase picks its OWN mode: prefill (n_tokens > 1) and decode (n_tokens == 1) are
+        // independently configurable (`MoeModes`) precisely because Task 4 measured them not to
+        // agree on which mode wins -- `mul_mv_id` decode beats `Loop` decode, but `mul_mm_id`
+        // prefill on a many-expert checkpoint LOSES to `Loop` prefill (78.0 vs 118.3 tok/s on the
+        // 35B/256-expert, 5304-token case). `QMetalStorage::indexed_moe_forward` still picks
+        // `mul_mv_id` vs `mul_mm_id` (and, for `mul_mm_id`, chunks the token axis) internally --
+        // this only decides whether `Fused` is asked for at all, for this call's `n_tokens`.
+        let phase_mode = if n_tokens == 1 {
+            self.decode_mode
+        } else {
+            self.prefill_mode
+        };
+        let out = match (phase_mode, self.stacked.as_ref()) {
             (MoeMode::Fused, Some(stacked)) => {
                 self.routed_fused(&xs, stacked, &topk_ids, &weights, n_tokens, hidden)?
             }
@@ -1069,7 +1113,7 @@ impl LayerWeights {
         hidden_size: usize,
         num_experts: usize,
         num_experts_per_tok: usize,
-        moe_mode: MoeMode,
+        moe_modes: MoeModes,
     ) -> Result<Self> {
         let prefix = format!("blk.{layer_idx}");
         let is_full_attention = (layer_idx + 1).is_multiple_of(full_attention_interval);
@@ -1102,7 +1146,12 @@ impl LayerWeights {
         // conclusion via `decoder_sparse_step` defaulting to 1 (qwen35moe has no such key), so the
         // condition reduces to `expert_count > 0`. Qwen3.6-35B-A3B: 40 of 40 layers.
         let mlp = if num_experts > 0 {
-            Ffn::Moe(MoeWeights::new(gg, &prefix, num_experts_per_tok, moe_mode)?)
+            Ffn::Moe(MoeWeights::new(
+                gg,
+                &prefix,
+                num_experts_per_tok,
+                moe_modes,
+            )?)
         } else {
             Ffn::Dense(MlpWeights::new(gg, &prefix)?)
         };
@@ -1159,18 +1208,19 @@ impl ModelWeights {
         reader: &mut R,
         device: &Device,
     ) -> Result<Self> {
-        Self::from_gguf_with_moe(ct, reader, device, MoeMode::default())
+        Self::from_gguf_with_moe(ct, reader, device, MoeModes::default())
     }
 
-    /// As [`ModelWeights::from_gguf`], but picking how the routed experts are evaluated.
+    /// As [`ModelWeights::from_gguf`], but picking how the routed experts are evaluated,
+    /// independently for prefill and decode -- see [`MoeModes`].
     ///
     /// The mode is a LOAD-time choice, not a per-call one, because [`MoeMode::Fused`] has to keep
-    /// the undivided expert stacks alive for the `mul_mv_id` kernel to index into.
+    /// the undivided expert stacks alive for the fused kernels to index into.
     pub fn from_gguf_with_moe<R: Read + Seek>(
         ct: gguf_file::Content,
         reader: &mut R,
         device: &Device,
-        moe_mode: MoeMode,
+        moe_modes: MoeModes,
     ) -> Result<Self> {
         let mut gg = Gguf::new(ct, reader, device.clone());
         // Key prefixes come from the file's own `general.architecture`, not from a hardcoded
@@ -1265,7 +1315,7 @@ impl ModelWeights {
                 hidden_size,
                 num_experts,
                 num_experts_per_tok,
-                moe_mode,
+                moe_modes,
             )?);
         }
 
