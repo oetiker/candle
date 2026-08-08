@@ -991,7 +991,13 @@ impl GatedDeltaNetWeights {
         let mixed_qkv = if use_precomputed_states {
             let conv_state = self.conv_state.as_mut().unwrap();
             let conv_state_data = Tensor::cat(&[conv_state, &mixed_qkv], 2)?;
-            *conv_state = conv_state_data.narrow(2, seq_len, self.conv_kernel_size - 1)?;
+            // .contiguous() is not cosmetic: narrow shares the storage Arc, so without it the
+            // layer would hold the whole [b, conv_dim, seq_len + k-1] f32 buffer alive for its
+            // lifetime just to keep k-1 columns. At a 5184-token prefill that is ~170 MB per
+            // layer over 30 layers.
+            *conv_state = conv_state_data
+                .narrow(2, seq_len, self.conv_kernel_size - 1)?
+                .contiguous()?;
             let out = conv_state_data.conv1d(&self.conv1d_weight, 0, 1, 1, self.conv_dim)?;
             candle_nn::ops::silu(&out)?
         } else {
@@ -1002,7 +1008,9 @@ impl GatedDeltaNetWeights {
                 mixed_qkv.device(),
             )?;
             let padded_qkv = Tensor::cat(&[&padding, &mixed_qkv], 2)?;
-            self.conv_state = Some(padded_qkv.narrow(2, seq_len, pad)?);
+            // .contiguous() for the same reason as the other branch: keep k-1 columns, not the
+            // whole padded prefill buffer they were narrowed out of.
+            self.conv_state = Some(padded_qkv.narrow(2, seq_len, pad)?.contiguous()?);
             let out = padded_qkv.conv1d(&self.conv1d_weight, 0, 1, 1, self.conv_dim)?;
             candle_nn::ops::silu(&out)?
         };
@@ -1038,11 +1046,13 @@ impl GatedDeltaNetWeights {
         let q = repeat_tiled(&q, repeat_n, 2)?;
         let k = repeat_tiled(&k, repeat_n, 2)?;
 
-        let initial_state = if use_precomputed_states {
-            self.recurrent_state.as_ref()
-        } else {
-            None
-        };
+        // Derived from `recurrent_state` itself, NOT from `use_precomputed_states` (which reads
+        // `conv_state`). Gating one field on the other means a state where `conv_state` is None but
+        // `recurrent_state` is Some silently DISCARDS the recurrent state and overwrites it two
+        // lines below -- and turn 1 still looks fine, which is the exact failure class this cache
+        // work exists to prevent. Unreachable through `forward` alone, but `set_layer_states` is
+        // public and can construct it. `as_ref()` is None-safe, so no current path changes.
+        let initial_state = self.recurrent_state.as_ref();
 
         let (core_attn_out, new_state) =
             self.torch_recurrent_gated_delta_rule(&q, &k, &v, &g, &beta, initial_state)?;
@@ -1266,6 +1276,28 @@ impl LayerState {
     }
 }
 
+/// A GatedDeltaNet state must have both halves or neither.
+///
+/// A forward can never produce a half-set state, but [`ModelWeights::set_layer_states`] is public
+/// and could be handed one. Applying it would mean the recurrence resumes while the conv window
+/// restarts from zero (or the reverse) -- wrong output, no error, and the first turn still looks
+/// fine, which is the failure class this whole cache path exists to prevent.
+fn check_delta_state_complete(
+    layer: usize,
+    conv: &Option<Tensor>,
+    recurrent: &Option<Tensor>,
+) -> Result<()> {
+    if conv.is_some() != recurrent.is_some() {
+        candle::bail!(
+            "layer {layer}: Delta state is half-set (conv={}, recurrent={}); both must be Some \
+             or both None",
+            if conv.is_some() { "Some" } else { "None" },
+            if recurrent.is_some() { "Some" } else { "None" }
+        );
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 pub struct ModelWeights {
     embed_tokens: Embedding,
@@ -1486,6 +1518,7 @@ impl ModelWeights {
                     }
                 }
                 (TokenMixer::LinearAttention(attn), LayerState::Delta { conv, recurrent }) => {
+                    check_delta_state_complete(i, conv, recurrent)?;
                     attn.conv_state = conv.clone();
                     attn.recurrent_state = recurrent.clone();
                 }
@@ -1499,6 +1532,153 @@ impl ModelWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A small GatedDeltaNet layer with random dense weights. Built field-by-field on purpose:
+    /// `GatedDeltaNetWeights::new` needs a GGUF, and requiring a 22 GB checkpoint is exactly why
+    /// this layer had no unit test and why the state-carry bug survived.
+    fn tiny_delta_layer(
+        hidden: usize,
+        num_v_heads: usize,
+        num_k_heads: usize,
+        head_k_dim: usize,
+        head_v_dim: usize,
+        conv_kernel_size: usize,
+        device: &Device,
+    ) -> GatedDeltaNetWeights {
+        let key_dim = head_k_dim * num_k_heads;
+        let value_dim = head_v_dim * num_v_heads;
+        let conv_dim = key_dim * 2 + value_dim;
+        // QMatMul::forward computes x @ w.t(), so a weight is [out, in]. GgmlDType::F32 is a
+        // pass-through "quantization", which keeps the arithmetic exact -- this test asserts bit
+        // equality, so a lossy dtype would blur the very thing being measured.
+        let w = |out: usize, r#in: usize| {
+            let t = Tensor::randn(0f32, 0.1f32, (out, r#in), device).unwrap();
+            QMatMul::from_weights(Arc::new(QTensor::quantize(&t, GgmlDType::F32).unwrap())).unwrap()
+        };
+        GatedDeltaNetWeights {
+            num_v_heads,
+            num_k_heads,
+            head_k_dim,
+            head_v_dim,
+            key_dim,
+            value_dim,
+            conv_dim,
+            conv_kernel_size,
+            in_proj_qkv: w(conv_dim, hidden),
+            in_proj_z: w(value_dim, hidden),
+            in_proj_b: w(num_v_heads, hidden),
+            in_proj_a: w(num_v_heads, hidden),
+            out_proj: w(hidden, value_dim),
+            conv1d_weight: Tensor::randn(0f32, 0.1f32, (conv_dim, 1, conv_kernel_size), device)
+                .unwrap(),
+            dt_bias_f32: Tensor::randn(0f32, 0.1f32, num_v_heads, device).unwrap(),
+            // Strictly negative, as the GGUF converter already stores -exp(A_log).
+            neg_a_f32: Tensor::full(-0.5f32, num_v_heads, device).unwrap(),
+            norm_weight: Tensor::ones(head_v_dim, DType::F32, device).unwrap(),
+            norm_eps: 1e-6,
+            conv_state: None,
+            recurrent_state: None,
+        }
+    }
+
+    fn max_abs_diff(a: &Tensor, b: &Tensor) -> f32 {
+        (a - b)
+            .unwrap()
+            .abs()
+            .unwrap()
+            .flatten_all()
+            .unwrap()
+            .to_vec1::<f32>()
+            .unwrap()
+            .iter()
+            .cloned()
+            .fold(0.0f32, f32::max)
+    }
+
+    /// A GatedDeltaNet layer must produce the same output whether the prompt is forwarded in one
+    /// pass or in two that meet on a `CHUNK_SIZE` boundary and carry state.
+    ///
+    /// This is the test whose absence let the real bug live: `use_precomputed_states` used to be
+    /// `self.conv_state.is_some() && seq_len == 1`, so the second forward here -- multi-token,
+    /// with state carried in -- silently threw the conv window and the recurrent state away and
+    /// restarted from zero. No error, fluent wrong output. Restoring that condition must make this
+    /// test fail; `qwen3_5_linear_attn_scan::tests::prefill_split_matches_undivided_cpu` covers the
+    /// scan arithmetic underneath it but cannot see this condition at all.
+    ///
+    /// Also covers the second half of the same bug class: after the split forward, the layer's
+    /// state must equal the undivided layer's state, or the NEXT turn diverges rather than this
+    /// one.
+    #[test]
+    fn delta_layer_split_prefill_matches_undivided_cpu() {
+        let device = Device::Cpu;
+        let (hidden, t, split) = (32usize, 192usize, 128usize);
+        assert_eq!(
+            split % crate::models::qwen3_5_linear_attn_scan::CHUNK_SIZE,
+            0
+        );
+
+        let mut whole = tiny_delta_layer(hidden, 4, 2, 8, 8, 4, &device);
+        let mut split_layer = whole.clone();
+
+        let x = Tensor::randn(0f32, 1.0f32, (1, t, hidden), &device).unwrap();
+
+        let out_whole = whole.forward(&x).unwrap();
+
+        let out_a = split_layer
+            .forward(&x.narrow(1, 0, split).unwrap())
+            .unwrap();
+        let out_b = split_layer
+            .forward(&x.narrow(1, split, t - split).unwrap())
+            .unwrap();
+        let out_split = Tensor::cat(&[&out_a, &out_b], 1).unwrap();
+
+        let out_diff = max_abs_diff(&out_whole, &out_split);
+        let rec_diff = max_abs_diff(
+            whole.recurrent_state.as_ref().unwrap(),
+            split_layer.recurrent_state.as_ref().unwrap(),
+        );
+        let conv_diff = max_abs_diff(
+            whole.conv_state.as_ref().unwrap(),
+            split_layer.conv_state.as_ref().unwrap(),
+        );
+        println!(
+            "t={t} split={split}: out_diff={out_diff} recurrent_diff={rec_diff} conv_diff={conv_diff}"
+        );
+
+        assert_eq!(
+            out_diff, 0.0,
+            "chunk-aligned split changed the layer output"
+        );
+        assert_eq!(
+            rec_diff, 0.0,
+            "chunk-aligned split left a different recurrent state"
+        );
+        assert_eq!(
+            conv_diff, 0.0,
+            "chunk-aligned split left a different conv state"
+        );
+    }
+
+    /// A half-set Delta state must be refused rather than silently half-applied. This is the
+    /// guard `set_layer_states` runs on every Delta layer.
+    #[test]
+    fn half_set_delta_state_is_rejected() {
+        let device = Device::Cpu;
+        let t = || Some(Tensor::zeros((1, 4, 8, 8), DType::F32, &device).unwrap());
+
+        check_delta_state_complete(3, &None, &None).expect("both None is a cleared layer");
+        check_delta_state_complete(3, &t(), &t()).expect("both Some is a live layer");
+
+        for (conv, rec) in [(t(), None), (None, t())] {
+            let err = check_delta_state_complete(3, &conv, &rec)
+                .expect_err("half-set Delta state must be refused");
+            let msg = err.to_string();
+            // The message has to name BOTH fields: "invalid state" would leave the caller
+            // guessing which half it forgot.
+            assert!(msg.contains("conv=") && msg.contains("recurrent="), "{msg}");
+            assert!(msg.contains("layer 3"), "{msg}");
+        }
+    }
 
     /// The 35B's `ffn_down_exps` is unsloth's dynamic quant: Q5_K on 37 layers, Q6_K on 3. A
     /// loader that reads the type once (e.g. from layer 0) and reuses it for all 40 layers will

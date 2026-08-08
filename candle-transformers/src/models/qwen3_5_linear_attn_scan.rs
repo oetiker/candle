@@ -531,6 +531,115 @@ mod tests {
         run_chunked_large_decay(&device, 42, 16, 128, 128);
     }
 
+    /// One undivided scan over `t` tokens, versus two scans that meet at `split` and carry state.
+    /// Returns `(out_diff, state_diff)`.
+    fn run_prefill_split(
+        device: &Device,
+        b: usize,
+        t: usize,
+        split: usize,
+        n_heads: usize,
+        hk: usize,
+        hv: usize,
+    ) -> (f32, f32) {
+        let q = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), device).unwrap();
+        let k = Tensor::randn(0f32, 0.1f32, (b, t, n_heads, hk), device).unwrap();
+        let v = Tensor::randn(0f32, 1.0f32, (b, t, n_heads, hv), device).unwrap();
+        let g_raw = Tensor::randn(-2.0f32, 1.0f32, (b, t, n_heads), device).unwrap();
+        let log_g = candle_nn::ops::sigmoid(&g_raw).unwrap().log().unwrap();
+        let beta_raw = Tensor::randn(0f32, 1.0f32, (b, t, n_heads), device).unwrap();
+        let beta = candle_nn::ops::sigmoid(&beta_raw).unwrap();
+
+        let mut state_whole = Tensor::zeros((b, n_heads, hk, hv), DType::F32, device).unwrap();
+        let out_whole =
+            gated_delta_rule_chunked(&q, &k, &v, &log_g, &beta, &mut state_whole).unwrap();
+
+        // Two forwards meeting at `split`, the second seeded with the first's final state --
+        // exactly what a restored prompt-cache snapshot does.
+        let part = |x: &Tensor, off: usize, len: usize| x.narrow(1, off, len).unwrap();
+        let mut state_split = Tensor::zeros((b, n_heads, hk, hv), DType::F32, device).unwrap();
+        let out_a = gated_delta_rule_chunked(
+            &part(&q, 0, split),
+            &part(&k, 0, split),
+            &part(&v, 0, split),
+            &part(&log_g, 0, split),
+            &part(&beta, 0, split),
+            &mut state_split,
+        )
+        .unwrap();
+        let rest = t - split;
+        let out_b = gated_delta_rule_chunked(
+            &part(&q, split, rest),
+            &part(&k, split, rest),
+            &part(&v, split, rest),
+            &part(&log_g, split, rest),
+            &part(&beta, split, rest),
+            &mut state_split,
+        )
+        .unwrap();
+        let out_split = Tensor::cat(&[&out_a, &out_b], 1).unwrap();
+
+        (
+            max_abs_diff(&out_whole, &out_split),
+            max_abs_diff(&state_whole, &state_split),
+        )
+    }
+
+    /// A prefill split on a `CHUNK_SIZE` boundary must be BIT-IDENTICAL to one undivided forward;
+    /// split anywhere else it is merely close.
+    ///
+    /// This is the property the prompt cache is built on. Exact equality is the claim precisely
+    /// because a boundary split reproduces the undivided chunk partition -- same chunks, same
+    /// order, same arithmetic -- so anything above 0.0 means the state carry is not what it looks
+    /// like. The companion test in quantized_qwen3_5.rs
+    /// (`delta_layer_split_prefill_matches_undivided_cpu`) checks that the LAYER actually uses
+    /// this carry; that is the one the old `&& seq_len == 1` condition breaks.
+    #[test]
+    fn prefill_split_matches_undivided_cpu() {
+        let device = Device::Cpu;
+        for &(b, t, split, n_heads, hk, hv) in &[
+            (1usize, 192usize, 64usize, 2usize, 4usize, 4usize),
+            (1, 192, 128, 2, 4, 4),
+            // split == t - t%64 is the shape the spike actually uses: cache a whole number of
+            // chunks, prefill the ragged tail.
+            (1, 200, 192, 2, 4, 4),
+            // realistic model dims
+            (1, 192, 128, 16, 128, 128),
+            (2, 192, 64, 2, 4, 4),
+        ] {
+            assert_eq!(
+                split % CHUNK_SIZE,
+                0,
+                "test bug: this case is meant to be chunk-aligned"
+            );
+            let (out_diff, state_diff) = run_prefill_split(&device, b, t, split, n_heads, hk, hv);
+            println!(
+                "aligned b={b} t={t} split={split}: out_diff={out_diff} state_diff={state_diff}"
+            );
+            assert_eq!(
+                out_diff, 0.0,
+                "b={b} t={t} split={split}: chunk-aligned split is not bit-identical"
+            );
+            assert_eq!(
+                state_diff, 0.0,
+                "b={b} t={t} split={split}: chunk-aligned split left a different state"
+            );
+        }
+
+        // Off-boundary: still correct, just no longer bit-identical. Asserted as a bound rather
+        // than as equality so nobody later "fixes" an unaligned split by loosening the aligned
+        // assertions above.
+        for &(t, split) in &[(192usize, 100usize), (200, 37)] {
+            let (out_diff, state_diff) = run_prefill_split(&device, 1, t, split, 2, 4, 4);
+            println!("unaligned t={t} split={split}: out_diff={out_diff} state_diff={state_diff}");
+            assert!(
+                out_diff < 1e-3 && state_diff < 1e-3,
+                "t={t} split={split}: unaligned split is not even close: \
+                 out_diff={out_diff} state_diff={state_diff}"
+            );
+        }
+    }
+
     #[test]
     fn chunked_matches_sequential_cpu() {
         let device = Device::Cpu;
