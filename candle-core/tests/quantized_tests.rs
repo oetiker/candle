@@ -1513,3 +1513,69 @@ test_device!(
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_cuda,
     from_data_dequant_matches_canonical_when_caller_passes_cow_owned_metal
 );
+
+// ---------------------------------------------------------------------------
+// Reproduction: quantizing a narrowed view silently quantizes the parent.
+//
+// Two shared-code defects compose into one silent wrong result:
+//
+//   1. `Tensor::contiguous` (candle-core/src/tensor.rs:2475) returns `self.clone()`
+//      whenever `is_contiguous()` is true. A row-narrowed tensor IS contiguous, so
+//      `contiguous()` is a NO-OP that preserves both the storage offset and the
+//      parent's full storage. `force_contiguous()` is the one that actually copies.
+//
+//   2. `QTensor::quantize` (candle-core/src/quantized/mod.rs:543-556) takes
+//      `src.storage()` and hands the WHOLE parent storage to the quantizer, using
+//      `shape.elem_count()` only to size the destination. The layout offset is never
+//      applied.
+//
+// So `QTensor::quantize(&t.narrow(..)?.contiguous()?, ..)` quantizes the parent's
+// first `shape.elem_count()` elements starting at element 0, not the narrowed rows.
+//
+// Behaviour on unmodified main, measured on CPU:
+//   release: silently returns the WRONG rows (this test's assert fires with 1.0 vs 2.0)
+//   debug:   panics in `k_quants.rs:666`, `debug_assert_eq!(ys.len(), k / BLCK_SIZE)`,
+//            with "size mismatch 128 1 32" -- 128 being the parent's element count.
+//
+// Release is what ships, so the shipped behaviour is the silent one. The debug assert
+// is what an implementer actually hits, and its message names neither `narrow` nor
+// `contiguous`, which is why this costs a full debugging cycle and gets blamed on the
+// quantization kernel.
+#[test]
+fn quantize_a_narrowed_view_uses_the_narrowed_rows() -> Result<()> {
+    let dev = Device::Cpu;
+    // Four rows of 32; row r is filled with the value r + 1.
+    let mut v = Vec::new();
+    for r in 0..4 {
+        v.extend(std::iter::repeat_n((r + 1) as f32, 32));
+    }
+    let parent = Tensor::from_vec(v, (4, 32), &dev)?;
+
+    let row1 = parent.narrow(0, 1, 1)?;
+    // The view is contiguous, so `contiguous()` will not copy it.
+    assert!(row1.is_contiguous());
+    assert_eq!(row1.layout().start_offset(), 32);
+    // Reading it through the normal tensor API gives the right values.
+    assert_eq!(row1.to_vec2::<f32>()?[0][0], 2.0);
+
+    let c = row1.contiguous()?;
+    let q = quantized::QTensor::quantize(&c, quantized::GgmlDType::Q8_0)?;
+    let got = q.dequantize(&dev)?.flatten_all()?.to_vec1::<f32>()?;
+
+    assert_eq!(
+        got,
+        vec![2.0f32; 32],
+        "quantize read the parent from element 0 instead of the narrowed view at offset 32"
+    );
+
+    // `force_contiguous` is the workaround: it copies, so the offset is resolved.
+    let f = row1.force_contiguous()?;
+    assert_eq!(f.layout().start_offset(), 0);
+    let qf = quantized::QTensor::quantize(&f, quantized::GgmlDType::Q8_0)?;
+    assert_eq!(
+        qf.dequantize(&dev)?.flatten_all()?.to_vec1::<f32>()?,
+        vec![2.0f32; 32]
+    );
+
+    Ok(())
+}
