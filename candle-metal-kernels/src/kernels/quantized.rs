@@ -324,6 +324,205 @@ pub fn call_quantized_matmul_mv_id(
     Ok(())
 }
 
+/// Fused MoE matrix-MATRIX (prefill): ggml's `kernel_mul_mm_id`, a tiled simdgroup-matrix kernel
+/// that -- unlike `mul_mv_id`'s one-threadgroup-per-output-row scheme -- amortizes each 64-row
+/// tile of an expert's weights over up to 32 (token, slot) pairs at once. Grid depth is
+/// `n_experts`: EVERY expert is dispatched, and each expert's threadgroup scans the full `ids`
+/// array (the "TODO: parallelize this loop" in `quantized.metal`'s `kernel_mul_mm_id`) to collect
+/// just the (token, slot) pairs routed to it, into a threadgroup-memory `rowids` scratch array.
+///
+/// This crate's `quantized.metal` is ggml-derived and already contains the whole
+/// `kernel_mul_mm_id_*` family (verified against `kernel_mul_mv_id`'s sibling story) -- nothing
+/// here is a new kernel, only a new Rust caller for one that already existed unreferenced.
+///
+/// Same shape contract as [`call_quantized_matmul_mv_id`]:
+/// - `src0` `[n_experts, n, k]`, quantized, row stride `row_stride_bytes`, expert stride
+///   `expert_stride_bytes`
+/// - `src1` `[batch, in_dim1, k]` f32, `in_dim1` either 1 (gate/up) or `topk` (down)
+/// - `ids`  `[batch, topk]` u32
+/// - `dst`  `[batch, topk, n]` f32
+///
+/// # The threadgroup-memory ceiling this function enforces, and why it cannot just chunk itself
+///
+/// The kernel keeps a `rowids` scratch array in threadgroup memory sized for the worst case of
+/// `topk * batch` entries (ggml's `dst_rows`; an expert cannot appear twice in one token's
+/// top-k list, so `batch` alone bounds how many rows any single expert can collect, and `topk`
+/// is the per-token stride ggml's own host code multiplies by -- see `ggml-metal.m` circa
+/// `611aa914e^`, `dst_rows_max`). `dst_rows*4` bytes of scratch sit past an 8192-byte
+/// simdgroup-matrix staging area, and Metal's `maxThreadgroupMemoryLength` is a hard per-dispatch
+/// ceiling (32768 bytes measured on M1 Max) -- there is no larger tier to request, and exceeding
+/// it is not a slowdown, it is a pipeline-creation/dispatch failure. A 5304-token prefill at
+/// `topk=8` is `dst_rows=42432`, forty times the ~2048-row budget that ceiling leaves: dispatching
+/// the whole prompt as one call is not an option on this hardware. So this function REFUSES any
+/// `(batch, topk)` whose `dst_rows` does not fit, rather than silently truncating `rowids` and
+/// losing token rows. The caller (`QMetalStorage::indexed_moe_forward`) chunks the token axis
+/// into sub-batches that fit and issues one dispatch per chunk, mirroring how ggml itself never
+/// sees more than one `n_ubatch` worth of tokens in a single `mul_mat_id` call.
+#[allow(clippy::too_many_arguments)]
+pub fn call_quantized_matmul_mm_id(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    dtype: GgmlDType,
+    (n_experts, n, k): (usize, usize, usize),
+    (batch, in_dim1, topk): (usize, usize, usize),
+    // Bytes between consecutive OUTPUT ROWS within one expert's matrix (nb01), and between
+    // consecutive experts (nb02, same quantity `call_quantized_matmul_mv_id` takes). Both are
+    // block-layout facts this crate's dtype-less `GgmlDType` cannot derive; the caller computes
+    // them from `n`, `k` and the *candle-core* `GgmlDType`'s block size / type size.
+    row_stride_bytes: usize,
+    expert_stride_bytes: usize,
+    src0: &Buffer,
+    src0_offset: usize,
+    src1: &Buffer,
+    src1_offset: usize,
+    ids: &Buffer,
+    ids_offset: usize,
+    dst: &Buffer,
+    dst_offset: usize,
+) -> Result<(), MetalKernelError> {
+    let name = match dtype {
+        GgmlDType::Q4K => "kernel_mul_mm_id_q4_K_f32",
+        GgmlDType::Q5K => "kernel_mul_mm_id_q5_K_f32",
+        GgmlDType::Q6K => "kernel_mul_mm_id_q6_K_f32",
+        GgmlDType::Q8_0 => "kernel_mul_mm_id_q8_0_f32",
+        // Every other instantiation is refused here even though `kernel_mul_mm_id_*` exists for
+        // most of them (see the f32/f16/id_bf16/legacy-quant/iq* template list in
+        // quantized.metal). Not because any of them is known-hazardous the way Q2K's `mv_id` is
+        // (see that refusal below): BLOCK_SIZE_M/N/K here are `#define`s shared by every dtype's
+        // `kernel_mul_mm_id` instantiation (quantized.metal:6984-6991), not a Rust-side
+        // per-dtype table a type can silently fall through the cracks of. This is purely "the
+        // model loader's SUPPORTED_EXPERT_QUANTS already promises only these four reach here, so
+        // this match is defense in depth, not a live decision."
+        GgmlDType::Q2K => Err(MetalKernelError::UnsupportedDTypeForOp("Q2K", "mul_mm_id"))?,
+        GgmlDType::F16 => Err(MetalKernelError::UnsupportedDTypeForOp("F16", "mul_mm_id"))?,
+        GgmlDType::F32 => Err(MetalKernelError::UnsupportedDTypeForOp("F32", "mul_mm_id"))?,
+        GgmlDType::BF16 => Err(MetalKernelError::UnsupportedDTypeForOp("BF16", "mul_mm_id"))?,
+        GgmlDType::Q3K => Err(MetalKernelError::UnsupportedDTypeForOp("Q3K", "mul_mm_id"))?,
+        GgmlDType::Q4_0 => Err(MetalKernelError::UnsupportedDTypeForOp("Q4_0", "mul_mm_id"))?,
+        GgmlDType::Q4_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q4_1", "mul_mm_id"))?,
+        GgmlDType::Q5_0 => Err(MetalKernelError::UnsupportedDTypeForOp("Q5_0", "mul_mm_id"))?,
+        GgmlDType::Q5_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q5_1", "mul_mm_id"))?,
+        GgmlDType::Q8_1 => Err(MetalKernelError::UnsupportedDTypeForOp("Q8_1", "mul_mm_id"))?,
+        GgmlDType::Q8K => Err(MetalKernelError::UnsupportedDTypeForOp("Q8K", "mul_mm_id"))?,
+    };
+    if n_experts == 0 {
+        return Err(MetalKernelError::InvalidInput(
+            "mul_mm_id: expert stack is empty".to_string(),
+        ));
+    }
+    if in_dim1 != 1 && in_dim1 != topk {
+        return Err(MetalKernelError::InvalidInput(format!(
+            "mul_mm_id: src1 dim1 {in_dim1} must be 1 or topk {topk}"
+        )));
+    }
+    // kernel_mul_mm_id_impl walks K in BLOCK_SIZE_K=32 strides with no tail handling; a K that
+    // does not divide evenly would read the dequantized tile past what the caller supplied.
+    if !k.is_multiple_of(32) {
+        return Err(MetalKernelError::InvalidInput(format!(
+            "mul_mm_id {name}: K {k} is not a multiple of 32, the kernel's BLOCK_SIZE_K"
+        )));
+    }
+
+    let dst_rows = topk * batch;
+    // SAFETY/CORRECTNESS: not a tuning knob. See the threadgroup-memory discussion on this
+    // function's doc comment.
+    let max_tg_mem = {
+        use objc2_metal::MTLDevice as _;
+        device.as_ref().maxThreadgroupMemoryLength()
+    };
+    let dst_rows_max = (max_tg_mem / 2).saturating_sub(8192) / 4;
+    if dst_rows > dst_rows_max {
+        return Err(MetalKernelError::InvalidInput(format!(
+            "mul_mm_id {name}: topk*batch {dst_rows} exceeds this device's dst_rows_max \
+             {dst_rows_max} (maxThreadgroupMemoryLength {max_tg_mem} bytes); caller must chunk \
+             the token axis, one dispatch cannot hold this many rowids in threadgroup memory"
+        )));
+    }
+
+    let f32_size = core::mem::size_of::<f32>();
+    let nei0 = topk as i64;
+    let nei1 = batch as i64;
+    let nbi1 = (topk * core::mem::size_of::<u32>()) as u64;
+    let ne00 = k as i64;
+    let ne02 = n_experts as i64;
+    let nb01 = row_stride_bytes as u64;
+    let nb02 = expert_stride_bytes as u64;
+    // src1 is contiguous [batch, in_dim1, k] f32: nb11 walks a slot, nb12 walks a token. Same
+    // layout `call_quantized_matmul_mv_id` assumes.
+    let nb10 = f32_size as u64;
+    let nb11 = (k * f32_size) as u64;
+    let nb12 = (in_dim1 * k * f32_size) as u64;
+    let ne11 = in_dim1 as i64;
+    let ne12 = batch as i64;
+    let ne13 = 1i64;
+    let ne0 = n as i64;
+    // What the kernel multiplies a token's batch index by when it rebases dst: dst is
+    // [batch, topk, n] and dst_cur = dst + jid[0]*ne0 + jid[1]*ne0*ne1, jid[0] the topk slot,
+    // jid[1] the token. So ne1 here is topk, exactly as in mv_id.
+    let ne1 = topk as i64;
+
+    let pipeline = kernels.load_pipeline(device, Source::Quantized, name)?;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(
+        encoder,
+        "qmm_mm_id {name} experts={n_experts} N={n} K={k} batch={batch} topk={topk}"
+    );
+
+    set_params!(
+        encoder,
+        (
+            (src0, src0_offset),
+            (src1, src1_offset),
+            Output::with_offset(dst, dst_offset),
+            (ids, ids_offset),
+            nei0,
+            nei1,
+            nbi1,
+            ne00,
+            ne02,
+            nb01,
+            nb02,
+            ne11,
+            ne12,
+            ne13,
+            nb10,
+            nb11,
+            nb12,
+            ne0,
+            ne1,
+            0u64 // nb1: declared by kernel_mul_mm_id (`constant uint64_t & nb1`) but never read
+                 // inside kernel_mul_mm_id_impl -- dst indexing is computed from ne0/ne1/jid
+                 // directly, the same way mv_id's trailing nb1 is dead.
+        )
+    );
+
+    // rowids lives in threadgroup memory past the 8192-byte simdgroup-matrix staging area ggml
+    // always reserves (matching the fixed 8192 call_quantized_matmul_mm_t already sets); the
+    // dst_rows check above guarantees this fits under maxThreadgroupMemoryLength.
+    encoder.set_threadgroup_memory_length(0, pad16(8192 + dst_rows * 4));
+
+    encoder.dispatch_thread_groups(
+        MTLSize {
+            width: divide(batch, 32), // BLOCK_SIZE_N columns of the compacted (token,slot) list
+            height: divide(n, 64),    // BLOCK_SIZE_M rows of the expert's output
+            depth: n_experts,         // every expert gets a threadgroup; most collect zero rows
+        },
+        MTLSize {
+            width: 128,
+            height: 1,
+            depth: 1,
+        },
+    );
+    Ok(())
+}
+
+fn pad16(x: usize) -> usize {
+    x.div_ceil(16) * 16
+}
+
 /// - src0 is usually weight
 /// - src1 is usually xs
 #[allow(clippy::too_many_arguments)]

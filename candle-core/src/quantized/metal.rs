@@ -569,7 +569,12 @@ impl QMetalStorage {
         if in_dim1 != 1 && in_dim1 != topk {
             crate::bail!("indexed_moe_forward input dim1 {in_dim1} must be 1 or topk {topk}")
         }
-        let expert_stride_bytes = n * k / self.dtype.block_size() * self.dtype.type_size();
+        // row_stride_bytes: bytes between consecutive OUTPUT ROWS within one expert's matrix.
+        // Only `mul_mm_id` (the prefill path below) reads this directly; `mul_mv_id` derives its
+        // own row addressing from `expert_stride_bytes` alone. Computed before the multiply-by-n
+        // so it is exact whenever k % block_size == 0, which every valid GGUF k-quant tensor is.
+        let row_stride_bytes = k / self.dtype.block_size() * self.dtype.type_size();
+        let expert_stride_bytes = row_stride_bytes * n;
         if expert_stride_bytes * n_experts != self.size {
             crate::bail!(
                 "indexed_moe_forward: {n_experts} experts of {expert_stride_bytes} bytes do not \
@@ -586,24 +591,89 @@ impl QMetalStorage {
             .with_label("qmoe_mv_id")
             .build()?;
         let encoder = device.command_encoder()?;
-        candle_metal_kernels::call_quantized_matmul_mv_id(
-            device.device(),
-            &encoder,
-            device.kernels(),
-            self.dtype.into(),
-            (n_experts, n, k),
-            (batch, in_dim1, topk),
-            expert_stride_bytes,
-            &self.buffer,
-            self.offset,
-            input.buffer(),
-            input_l.start_offset() * DType::F32.size_in_bytes(),
-            ids.buffer(),
-            ids_l.start_offset() * DType::U32.size_in_bytes(),
-            &dst,
-            0,
-        )
-        .map_err(MetalError::from)?;
+
+        let input_base = input_l.start_offset() * DType::F32.size_in_bytes();
+        let ids_base = ids_l.start_offset() * DType::U32.size_in_bytes();
+
+        if batch == 1 {
+            // Decode: one token, one `mul_mv_id` dispatch, one threadgroup per output row.
+            candle_metal_kernels::call_quantized_matmul_mv_id(
+                device.device(),
+                &encoder,
+                device.kernels(),
+                self.dtype.into(),
+                (n_experts, n, k),
+                (batch, in_dim1, topk),
+                expert_stride_bytes,
+                &self.buffer,
+                self.offset,
+                input.buffer(),
+                input_base,
+                ids.buffer(),
+                ids_base,
+                &dst,
+                0,
+            )
+            .map_err(MetalError::from)?;
+        } else {
+            // Prefill: `mul_mm_id`'s tiled simdgroup-matrix kernel, chunked along the token axis
+            // so `topk * chunk` never exceeds what Metal's threadgroup memory can hold for the
+            // kernel's `rowids` scratch array. See `call_quantized_matmul_mm_id`'s doc comment --
+            // this is not a tuning choice, dispatching the whole prompt in one call is a hard
+            // failure on real hardware (5304 tokens * topk=8 is ~20x the ~2048-row budget on an
+            // M1 Max's 32768-byte maxThreadgroupMemoryLength).
+            let max_tg_mem = {
+                use objc2_metal::MTLDevice as _;
+                device.device().as_ref().maxThreadgroupMemoryLength()
+            };
+            let dst_rows_max = (max_tg_mem / 2).saturating_sub(8192) / 4;
+            // Chunk size is capped at 32, NOT maximized to `dst_rows_max`, for a reason that is
+            // about correctness-in-practice rather than tuning: `kernel_mul_mm_id`'s row-id
+            // collection ("// TODO: parallelize this loop" in quantized.metal, ggml's own words)
+            // runs UNPARALLELIZED on every one of a threadgroup's 128 threads, scanning all
+            // `chunk * topk` ids -- and every one of `n_experts` dispatched threadgroups per tile
+            // pays that scan even when it finds no rows for its expert. That cost is
+            // O(chunk^2 * n_experts): linear in chunk from the scan length, another linear factor
+            // from grid width (`divide(chunk, 32)`) scaling with chunk too. At the 256-expert 35B,
+            // chunk = dst_rows_max/topk = 256 measured as indistinguishable from a GPU hang (killed
+            // after 20+ min of no progress); chunk = 32 measured a real 68s for the whole
+            // 5304-token prefill, chunk = 64 measured 77s (worse despite half the dispatch count,
+            // consistent with the quadratic term dominating already). 32 is conservative, not
+            // tuned -- Task 10 owns finding the actual optimum, and may find ggml's own
+            // dst_rows-worth-it heuristic (`dst_rows > n_as`) or a parallel row-id scan changes
+            // this entirely.
+            let max_batch_per_dispatch = (dst_rows_max / topk).clamp(1, 32);
+
+            let in_row_bytes = in_dim1 * k * DType::F32.size_in_bytes();
+            let ids_row_bytes = topk * DType::U32.size_in_bytes();
+            let dst_row_bytes = topk * n * DType::F32.size_in_bytes();
+
+            let mut done = 0usize;
+            while done < batch {
+                let chunk = (batch - done).min(max_batch_per_dispatch);
+                candle_metal_kernels::call_quantized_matmul_mm_id(
+                    device.device(),
+                    &encoder,
+                    device.kernels(),
+                    self.dtype.into(),
+                    (n_experts, n, k),
+                    (chunk, in_dim1, topk),
+                    row_stride_bytes,
+                    expert_stride_bytes,
+                    &self.buffer,
+                    self.offset,
+                    input.buffer(),
+                    input_base + done * in_row_bytes,
+                    ids.buffer(),
+                    ids_base + done * ids_row_bytes,
+                    &dst,
+                    done * dst_row_bytes,
+                )
+                .map_err(MetalError::from)?;
+                done += chunk;
+            }
+        }
+
         let dst_storage =
             crate::MetalStorage::new(dst, device.clone(), dst_shape.elem_count(), DType::F32);
         Ok((dst_storage, dst_shape))

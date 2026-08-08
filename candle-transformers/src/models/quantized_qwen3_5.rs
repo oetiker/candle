@@ -161,11 +161,12 @@ pub fn read_expert_quants_per_layer<P: AsRef<std::path::Path>>(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum MoeMode {
     /// Group tokens by expert on the host and issue one plain quantized matmul per non-empty
-    /// group. Correct everywhere, and the only path for prefill until Task 4's `mm_id`.
+    /// group. Correct everywhere; the reference path the llama.cpp gate was closed against.
     #[default]
     Loop,
-    /// Decode (one token) goes through the fused `mul_mv_id` Metal kernel: no host readback of
-    /// the routing, no per-expert dispatch. Prefill still uses the loop.
+    /// Every token count goes through a fused Metal kernel: no host readback of the routing, no
+    /// per-expert dispatch. Decode (one token) uses `mul_mv_id`; prefill (many tokens) uses
+    /// `mul_mm_id`, chosen inside `QMetalStorage::indexed_moe_forward` by `batch == 1`.
     Fused,
 }
 
@@ -438,12 +439,13 @@ impl MoeWeights {
         Ok(out)
     }
 
-    /// The routed experts, as three fused `mul_mv_id` dispatches. Returns `[n_tokens, hidden]`.
+    /// The routed experts, as three fused Metal-kernel dispatches (`mul_mv_id` for one token,
+    /// `mul_mm_id` for many). Returns `[n_tokens, hidden]`.
     ///
-    /// Entirely on device: the routing is never read back, so the decode step loses the sync that
-    /// [`MoeWeights::routed_loop`] needs. Decode only -- one `mul_mv_id` threadgroup re-reads a
-    /// whole expert matrix, which is the right trade for a single token and catastrophically the
-    /// wrong one for a 5304-token prefill (Task 4's `mm_id` is the prefill answer).
+    /// Entirely on device: the routing is never read back, so this loses the sync that
+    /// [`MoeWeights::routed_loop`]'s host-side grouping needs. Which underlying kernel runs is
+    /// `QMetalStorage::indexed_moe_forward`'s call, not this function's -- it always calls
+    /// `indexed_moe_forward` the same way regardless of `n_tokens`.
     ///
     /// The top-k slots are sorted by ASCENDING EXPERT ID before the weighted sum. That is not
     /// cosmetic: `routed_loop` accumulates `out += w_e * y_e` walking `e` from 0 upward, and f32
@@ -491,9 +493,10 @@ impl Module for MoeWeights {
 
         let (topk_ids, weights) = self.route(&xs)?;
 
-        // The fused kernel is a DECODE kernel; prefill stays on the grouped loop until Task 4.
+        // Fused covers both decode and prefill now: `QMetalStorage::indexed_moe_forward` picks
+        // `mul_mv_id` vs `mul_mm_id` (and, for `mul_mm_id`, chunks the token axis) internally.
         let out = match (self.mode, self.stacked.as_ref()) {
-            (MoeMode::Fused, Some(stacked)) if n_tokens == 1 => {
+            (MoeMode::Fused, Some(stacked)) => {
                 self.routed_fused(&xs, stacked, &topk_ids, &weights, n_tokens, hidden)?
             }
             _ => self.routed_loop(&xs, &topk_ids, &weights, n_tokens, hidden)?,
