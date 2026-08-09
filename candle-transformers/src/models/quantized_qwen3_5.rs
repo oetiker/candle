@@ -187,6 +187,40 @@ impl std::str::FromStr for MoeMode {
     }
 }
 
+/// How the full-attention layers consume the KV cache under grouped-query attention.
+///
+/// Unlike [`MoeMode`] this is a pure forward-path choice with no load-time consequence -- nothing
+/// extra is built for either arm -- so it is settable at runtime via
+/// [`ModelWeights::set_attn_mode`].
+///
+/// This checkpoint is `head_count = 16`, `head_count_kv = 2`, i.e. **GQA group 8** with
+/// `head_dim = 256`, over 10 full-attention layers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AttnMode {
+    /// Materialize the GQA-expanded cache with [`repeat_kv`] and run one matmul per expanded head.
+    /// The reference path every gate so far was closed against.
+    #[default]
+    Naive,
+    /// Batch the query heads of one KV group together and matmul against the UNEXPANDED cache.
+    ///
+    /// Arithmetically identical -- the same dot products, grouped differently rather than
+    /// replicated -- but it never writes the 8x copy. `Naive` spends roughly 412 MB of memory
+    /// traffic per full-attention layer per decode token at a 5304-token prefix, of which only
+    /// ~21.7 MB is the irreducible read of the cache itself.
+    Grouped,
+}
+
+impl std::str::FromStr for AttnMode {
+    type Err = candle::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "naive" => Ok(Self::Naive),
+            "grouped" => Ok(Self::Grouped),
+            other => candle::bail!("unknown attention mode {other}, expected `naive` or `grouped`"),
+        }
+    }
+}
+
 /// [`MoeMode`], independently, for prefill (`batch > 1`) and decode (`batch == 1`).
 ///
 /// A LOAD-time choice, like `MoeMode` itself: the stacked expert tensors `Fused` needs are built
@@ -682,6 +716,7 @@ struct AttentionWeights {
     head_dim: usize,
     rotary_emb: Arc<RotaryEmbedding>,
     kv_cache: ConcatKvCache,
+    attn_mode: AttnMode,
 }
 
 impl AttentionWeights {
@@ -722,6 +757,7 @@ impl AttentionWeights {
             head_dim,
             rotary_emb,
             kv_cache,
+            attn_mode: AttnMode::default(),
         })
     }
 
@@ -756,11 +792,35 @@ impl AttentionWeights {
 
         let (k, v) = self.kv_cache.append(&k, &v)?;
 
-        let k = repeat_kv(k, self.num_kv_groups)?.contiguous()?;
-        let v = repeat_kv(v, self.num_kv_groups)?.contiguous()?;
-
         let scale = 1.0 / (self.head_dim as f64).sqrt();
-        let mut scores = (q.matmul(&k.transpose(2, 3)?)? * scale)?;
+        let n_kv = self.num_kv_heads;
+        let g = self.num_kv_groups;
+        // `p` is the full cached length (prefix + this forward's tokens), not `l`.
+        let p = k.dim(2)?;
+
+        // Both arms compute the SAME dot products. `Naive` replicates each KV head `g` times and
+        // runs `num_heads` independent matmuls; `Grouped` folds the group axis into the query rows
+        // of one matmul per KV head, so the cache is read once instead of copied `g` times.
+        //
+        // The reshape below is only valid because `repeat_kv` is HEAD-MAJOR -- it cats `g` copies
+        // along the sequence axis and reshapes, so expanded head `h` is KV head `h / g`, and the
+        // `[b, n_kv, g, ...]` split reproduces exactly that pairing. An interleaved `repeat_kv`
+        // would make this silently compute the wrong attention while still emitting fluent text.
+        // Pinned by `repeat_kv_is_head_major` below.
+        let mut scores = match self.attn_mode {
+            AttnMode::Naive => {
+                let k = repeat_kv(k.clone(), g)?.contiguous()?;
+                (q.matmul(&k.transpose(2, 3)?)? * scale)?
+            }
+            AttnMode::Grouped => {
+                // No `.contiguous()` on the transposed K: that would copy the very cache this arm
+                // exists to stop copying. `matmul` takes a strided rhs -- the `Naive` arm relies on
+                // exactly the same thing.
+                let qg = q.contiguous()?.reshape((b, n_kv, g * l, self.head_dim))?;
+                let s = (qg.matmul(&k.transpose(2, 3)?)? * scale)?;
+                s.reshape((b, n_kv * g, l, p))?
+            }
+        };
         if let Some(m) = attn_mask {
             let m_dtype = m.dtype();
             let scores_dtype = scores.dtype();
@@ -772,7 +832,17 @@ impl AttentionWeights {
             scores = scores.broadcast_add(&mask)?;
         }
         let probs = candle_nn::ops::softmax_last_dim(&scores)?;
-        let ctx = probs.matmul(&v)?;
+        let ctx = match self.attn_mode {
+            AttnMode::Naive => {
+                let v = repeat_kv(v, g)?.contiguous()?;
+                probs.matmul(&v)?
+            }
+            AttnMode::Grouped => {
+                let pg = probs.contiguous()?.reshape((b, n_kv, g * l, p))?;
+                let c = pg.matmul(&v)?;
+                c.reshape((b, n_kv * g, l, self.head_dim))?
+            }
+        };
 
         let ctx = ctx.transpose(1, 2)?;
         // Apply sigmoid gate
@@ -1215,6 +1285,12 @@ impl LayerWeights {
             TokenMixer::LinearAttention(attn) => attn.clear_kv_cache(),
         }
     }
+
+    fn set_attn_mode(&mut self, mode: AttnMode) {
+        if let TokenMixer::FullAttention(attn) = &mut self.token_mixer {
+            attn.attn_mode = mode;
+        }
+    }
 }
 
 /// The whole inference state of one layer — everything that makes a forward depend on the tokens
@@ -1472,6 +1548,16 @@ impl ModelWeights {
         }
     }
 
+    /// Select how the full-attention layers consume the KV cache -- see [`AttnMode`].
+    ///
+    /// Runtime, not load time: neither arm builds anything, so one binary can A/B them with a
+    /// command-line switch. Layers other than full-attention are unaffected.
+    pub fn set_attn_mode(&mut self, mode: AttnMode) {
+        for layer in &mut self.layers {
+            layer.set_attn_mode(mode);
+        }
+    }
+
     /// Every layer's inference state, in layer order.
     ///
     /// The tensors SHARE storage with the model — this is a borrow made owned, not a copy. Use
@@ -1532,6 +1618,45 @@ impl ModelWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `AttnMode::Grouped` folds the query-head axis as `[b, n_kv, g, l, d]`, which pairs query
+    /// head `h` with KV head `h / g`. That is only correct if `repeat_kv` is HEAD-MAJOR. It is
+    /// implemented as `cat(g copies, dim=2).reshape(...)`, which is not obviously either way, and
+    /// an interleaved layout (`h % n_kv`) would make `Grouped` attend to the wrong KV head while
+    /// still emitting fluent, plausible German that no eye-read catches.
+    ///
+    /// This port has already shipped exactly that bug once, in the opposite direction: candle bug
+    /// #3 was a q/k broadcast that was interleaved where it had to be tiled.
+    #[test]
+    fn repeat_kv_is_head_major() -> Result<()> {
+        use candle::IndexOp;
+        let dev = Device::Cpu;
+        let (n_kv, g, seq, dim) = (2usize, 3usize, 4usize, 5usize);
+        // Value encodes its own KV-head index, so the expanded tensor can be read back directly.
+        let base: Vec<f32> = (0..n_kv)
+            .flat_map(|j| std::iter::repeat_n(j as f32, seq * dim))
+            .collect();
+        let xs = Tensor::from_vec(base, (1, n_kv, seq, dim), &dev)?;
+
+        let out = repeat_kv(xs, g)?;
+        assert_eq!(out.dims(), &[1, n_kv * g, seq, dim]);
+
+        for h in 0..n_kv * g {
+            let got = out.i((0, h, 0, 0))?.to_scalar::<f32>()?;
+            assert_eq!(
+                got,
+                (h / g) as f32,
+                "expanded head {h} came from KV head {got}, expected {} (head-major). \
+                 If this fails, AttnMode::Grouped's reshape is WRONG and must be re-derived.",
+                h / g
+            );
+            // And explicitly NOT the interleaved layout, wherever the two differ.
+            if h / g != h % n_kv {
+                assert_ne!(got, (h % n_kv) as f32, "layout is interleaved, not head-major");
+            }
+        }
+        Ok(())
+    }
 
     /// A small GatedDeltaNet layer with random dense weights. Built field-by-field on purpose:
     /// `GatedDeltaNetWeights::new` needs a GGUF, and requiring a 22 GB checkpoint is exactly why
