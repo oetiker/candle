@@ -221,6 +221,36 @@ impl std::str::FromStr for AttnMode {
     }
 }
 
+/// How the 30 GatedDeltaNet layers evaluate the gated delta recurrence.
+///
+/// Like [`AttnMode`] this is a pure forward-path choice with no load-time consequence, so it is
+/// settable at runtime via [`ModelWeights::set_delta_mode`] and one binary can A/B both arms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum DeltaMode {
+    /// The pure-Candle path: chunked WY scan at `seq_len > 1`, `sequential_step` at `seq_len == 1`.
+    /// The reference arm every gate so far was closed against, and the permanent default -- a gate
+    /// invocation that omits `--delta` must not silently change arms.
+    #[default]
+    Chunked,
+    /// One fused Metal kernel covering ANY `seq_len`, replacing BOTH branches above. The recurrent
+    /// state lives in registers across the whole `t` loop and never touches memory in between.
+    ///
+    /// Metal only, and it BAILS rather than falling back: a silent fallback would make a pricing
+    /// round measure the reference arm twice and report it as a speedup.
+    Kernel,
+}
+
+impl std::str::FromStr for DeltaMode {
+    type Err = candle::Error;
+    fn from_str(s: &str) -> Result<Self> {
+        match s {
+            "chunked" => Ok(Self::Chunked),
+            "kernel" => Ok(Self::Kernel),
+            other => candle::bail!("unknown delta mode {other}, expected `chunked` or `kernel`"),
+        }
+    }
+}
+
 /// [`MoeMode`], independently, for prefill (`batch > 1`) and decode (`batch == 1`).
 ///
 /// A LOAD-time choice, like `MoeMode` itself: the stacked expert tensors `Fused` needs are built
@@ -884,6 +914,9 @@ struct GatedDeltaNetWeights {
 
     conv_state: Option<Tensor>,
     recurrent_state: Option<Tensor>,
+
+    /// Runtime arm selector -- see [`DeltaMode`]. Defaults to `Chunked`, permanently.
+    delta_mode: DeltaMode,
 }
 
 impl GatedDeltaNetWeights {
@@ -960,6 +993,7 @@ impl GatedDeltaNetWeights {
             norm_eps: rms_norm_eps,
             conv_state: None,
             recurrent_state: None,
+            delta_mode: DeltaMode::default(),
         })
     }
 
@@ -1012,6 +1046,29 @@ impl GatedDeltaNetWeights {
         let value_f32 = value.to_dtype(DType::F32)?;
         let beta_f32 = beta.to_dtype(DType::F32)?;
         let log_g_f32 = g.to_dtype(DType::F32)?;
+
+        // DeltaMode::Kernel replaces BOTH branches below: ONE launch covers any `seq_len`, so
+        // prefill and decode stop being different call sites. That is D34's requirement, and it is
+        // also what mlx does -- mlx has no chunked path at all.
+        if self.delta_mode == DeltaMode::Kernel {
+            if !query.device().is_metal() {
+                candle::bail!(
+                    "DeltaMode::Kernel is Metal-only and does not fall back: a silent fallback \
+                     would make a pricing round measure DeltaMode::Chunked twice"
+                );
+            }
+            // The kernel takes the DECAY, not the log-decay. mlx's `compute_g` returns
+            // `exp(-exp(A_log) * softplus(...))`; our `g` is that expression's LOG, which is what
+            // the chunked scan's cumsum needs. `sequential_step` likewise exponentiates first.
+            let g_exp = log_g_f32.exp()?;
+            // q/k arrive already expanded to Hk == Hv by `repeat_tiled` (see
+            // `repeat_tiled_is_cyclic_not_grouped`), so the kernel's head mapping is the identity
+            // and cannot disagree with the GGUF's cyclic layout.
+            let (output, new_state) = candle_nn::gated_delta::gated_delta(
+                &query_f32, &key_f32, &value_f32, &g_exp, &beta_f32, &state,
+            )?;
+            return Ok((output, new_state));
+        }
 
         let output = if seq_len == 1 {
             let q_t = query_f32.squeeze(1)?;
@@ -1291,6 +1348,12 @@ impl LayerWeights {
             attn.attn_mode = mode;
         }
     }
+
+    fn set_delta_mode(&mut self, mode: DeltaMode) {
+        if let TokenMixer::LinearAttention(attn) = &mut self.token_mixer {
+            attn.delta_mode = mode;
+        }
+    }
 }
 
 /// The whole inference state of one layer — everything that makes a forward depend on the tokens
@@ -1558,6 +1621,16 @@ impl ModelWeights {
         }
     }
 
+    /// Select how the GatedDeltaNet layers evaluate the recurrence -- see [`DeltaMode`].
+    ///
+    /// Runtime, not load time: neither arm builds anything, so one binary can A/B them with a
+    /// command-line switch. Full-attention layers are unaffected.
+    pub fn set_delta_mode(&mut self, mode: DeltaMode) {
+        for layer in &mut self.layers {
+            layer.set_delta_mode(mode);
+        }
+    }
+
     /// Every layer's inference state, in layer order.
     ///
     /// The tensors SHARE storage with the model — this is a borrow made owned, not a copy. Use
@@ -1658,6 +1731,70 @@ mod tests {
         Ok(())
     }
 
+    /// Which k-head does v-head `h` read on the CURRENT, GATED GatedDeltaNet path?
+    ///
+    /// Answer: `h % num_k_heads` — CYCLIC/tiled, ggml's `repeat` semantics. This single fact is
+    /// what the `DeltaMode::Kernel` transliteration rests on: mlx's kernel derives the k-head
+    /// *inside* the kernel as `hk_idx = hv_idx / (Hv / Hk)`, which is the GROUPED mapping and
+    /// DISAGREES with ours at `repeat_n == 2` (this checkpoint: 32 v-heads, 16 k-heads). The
+    /// kernel therefore takes q/k already expanded by `repeat_tiled`, with `Hk == Hv`, so its
+    /// internal mapping is the identity and cannot disagree with anything.
+    ///
+    /// Ours is the arm proven 84/84 against llama.cpp on this checkpoint, so ours wins by default.
+    /// If this test ever fails, the kernel's `Hk == Hv` premise is void — STOP, do not adjust.
+    #[test]
+    fn repeat_tiled_is_cyclic_not_grouped() -> Result<()> {
+        use candle::IndexOp;
+        let dev = Device::Cpu;
+        // The live shape class: num_v_heads 32 / num_k_heads 16 -> repeat_n 2. Smaller here, but
+        // repeat_n MUST be > 1 or the two mappings coincide and the test cannot fail.
+        let (n_k, repeat_n, t, d) = (3usize, 2usize, 4usize, 5usize);
+        assert!(repeat_n > 1, "repeat_n == 1 makes both mappings the identity");
+        // Value encodes its own k-head index, so the expanded tensor can be read back directly.
+        // Layout is [b, t, n_k, d]: the head axis is dim 2, which is what the model expands.
+        let base: Vec<f32> = (0..t)
+            .flat_map(|_| (0..n_k).flat_map(|j| std::iter::repeat_n(j as f32, d)))
+            .collect();
+        let xs = Tensor::from_vec(base, (1, t, n_k, d), &dev)?;
+
+        let out = repeat_tiled(&xs, repeat_n, 2)?;
+        assert_eq!(out.dims(), &[1, t, n_k * repeat_n, d]);
+
+        let mut differing = 0usize;
+        for h in 0..n_k * repeat_n {
+            let got = out.i((0, 0, h, 0))?.to_scalar::<f32>()?;
+            assert_eq!(
+                got,
+                (h % n_k) as f32,
+                "v-head {h} read k-head {got}, expected {} (cyclic/tiled, ggml repeat). \
+                 If this fails, the DeltaMode::Kernel Hk == Hv premise is VOID.",
+                h % n_k
+            );
+            // And explicitly NOT mlx's in-kernel grouped mapping, wherever the two differ.
+            if h % n_k != h / repeat_n {
+                differing += 1;
+                assert_ne!(
+                    got,
+                    (h / repeat_n) as f32,
+                    "v-head {h} took the GROUPED mapping h/repeat_n -- that is mlx's in-kernel \
+                     mapping and it is wrong for this GGUF"
+                );
+            }
+        }
+        // Guard against the test passing vacuously on a shape where the two mappings agree
+        // everywhere: there must be positions that actually discriminate between them.
+        assert!(
+            differing >= 2,
+            "shape does not discriminate cyclic from grouped ({differing} differing heads)"
+        );
+        // Every time step sees the same expansion, not just t == 0.
+        for tt in 0..t {
+            let got = out.i((0, tt, n_k, 0))?.to_scalar::<f32>()?;
+            assert_eq!(got, 0f32, "expansion is not uniform across time at t={tt}");
+        }
+        Ok(())
+    }
+
     /// A small GatedDeltaNet layer with random dense weights. Built field-by-field on purpose:
     /// `GatedDeltaNetWeights::new` needs a GGUF, and requiring a 22 GB checkpoint is exactly why
     /// this layer had no unit test and why the state-carry bug survived.
@@ -1703,6 +1840,9 @@ mod tests {
             norm_eps: 1e-6,
             conv_state: None,
             recurrent_state: None,
+            // These CPU tests exercise the reference arm; DeltaMode::Kernel is Metal-only and
+            // bails rather than falling back, so it must not be the default here either.
+            delta_mode: DeltaMode::Chunked,
         }
     }
 
