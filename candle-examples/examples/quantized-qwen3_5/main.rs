@@ -8,33 +8,27 @@ use clap::{Parser, ValueEnum};
 use std::io::Write;
 use tokenizers::Tokenizer;
 
+use candle::quantized::gguf_file;
 use candle::Tensor;
-use candle::{quantized::gguf_file, DType};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 
 use candle_examples::token_output_stream::TokenOutputStream;
-use candle_transformers::models::quantized_qwen3_moe::GGUFQWenMoE as Qwen3_MoE;
+use candle_transformers::models::quantized_qwen3_5::ModelWeights as Qwen3_5;
 
 const DEFAULT_PROMPT: &str = "Write a Rust function to calculate the factorial of a given number.";
 
 #[derive(Clone, Debug, Copy, PartialEq, Eq, ValueEnum)]
 enum Which {
-    #[value(name = "16b_q2k")]
-    W3_16bQ2K,
-    #[value(name = "16b_q4k")]
-    W3_16bQ4K,
-    #[value(name = "16b_q6k")]
-    W3_16bQ6K,
-    #[value(name = "16b_q80")]
-    W3_16bQ80,
-    #[value(name = "32b_q2k")]
-    W3_32bQ2K,
-    #[value(name = "32b_q4k")]
-    W3_32bQ4K,
-    #[value(name = "32b_q6k")]
-    W3_32bQ6K,
-    #[value(name = "32b_q80")]
-    W3_32bQ80,
+    #[value(name = "0.8b")]
+    W3_5_0_8b,
+    #[value(name = "2b")]
+    W3_5_2b,
+    #[value(name = "4b")]
+    W3_5_4b,
+    #[value(name = "9b")]
+    W3_5_9b,
+    #[value(name = "27b")]
+    W3_5_27b,
 }
 
 #[derive(Parser, Debug)]
@@ -95,11 +89,8 @@ struct Args {
     repeat_last_n: usize,
 
     /// The model size to use.
-    #[arg(long, default_value = "16b_q2k")]
+    #[arg(long, default_value = "0.8b")]
     which: Which,
-
-    #[arg(long, default_value = "bf16")]
-    dtype: String,
 }
 
 impl Args {
@@ -108,7 +99,13 @@ impl Args {
             Some(config) => std::path::PathBuf::from(config),
             None => {
                 let api = hf_hub::api::sync::Api::new()?;
-                let repo = "Qwen/Qwen3-30B-A3B-Instruct-2507";
+                let repo = match self.which {
+                    Which::W3_5_0_8b => "Qwen/Qwen3.5-0.8B",
+                    Which::W3_5_2b => "Qwen/Qwen3.5-2B",
+                    Which::W3_5_4b => "Qwen/Qwen3.5-4B",
+                    Which::W3_5_9b => "Qwen/Qwen3.5-9B",
+                    Which::W3_5_27b => "Qwen/Qwen3.5-27B",
+                };
                 let api = api.model(repo.to_string());
                 api.get("tokenizer.json")?
             }
@@ -121,45 +118,17 @@ impl Args {
             Some(config) => std::path::PathBuf::from(config),
             None => {
                 let (repo, filename, revision) = match self.which {
-                    Which::W3_16bQ2K => (
-                        "unsloth/Qwen3-16B-A3B-GGUF",
-                        "Qwen3-16B-A3B-Q2_K.gguf",
+                    Which::W3_5_0_8b => (
+                        "unsloth/Qwen3.5-0.8B-GGUF",
+                        "Qwen3.5-0.8B-Q4_K_M.gguf",
                         "main",
                     ),
-                    Which::W3_16bQ4K => (
-                        "unsloth/Qwen3-16B-A3B-GGUF",
-                        "Qwen3-16B-A3B-Q4_K_M.gguf",
-                        "main",
-                    ),
-                    Which::W3_16bQ6K => (
-                        "unsloth/Qwen3-16B-A3B-GGUF",
-                        "Qwen3-16B-A3B-Q6_K.gguf",
-                        "main",
-                    ),
-                    Which::W3_16bQ80 => (
-                        "unsloth/Qwen3-16B-A3B-GGUF",
-                        "Qwen3-16B-A3B-Q8_0.gguf",
-                        "main",
-                    ),
-
-                    Which::W3_32bQ2K => (
-                        "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-                        "Qwen3-30B-A3B-Instruct-2507-Q2_K.gguf",
-                        "main",
-                    ),
-                    Which::W3_32bQ4K => (
-                        "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-                        "Qwen3-30B-A3B-Instruct-2507-Q4_K_M.gguf",
-                        "main",
-                    ),
-                    Which::W3_32bQ6K => (
-                        "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-                        "Qwen3-30B-A3B-Instruct-2507-Q6_K.gguf",
-                        "main",
-                    ),
-                    Which::W3_32bQ80 => (
-                        "unsloth/Qwen3-30B-A3B-Instruct-2507-GGUF",
-                        "Qwen3-30B-A3B-Instruct-2507-Q8_0.gguf",
+                    Which::W3_5_2b => ("unsloth/Qwen3.5-2B-GGUF", "Qwen3.5-2B-Q4_K_M.gguf", "main"),
+                    Which::W3_5_4b => ("unsloth/Qwen3.5-4B-GGUF", "Qwen3.5-4B-Q4_K_M.gguf", "main"),
+                    Which::W3_5_9b => ("unsloth/Qwen3.5-9B-GGUF", "Qwen3.5-9B-Q4_K_M.gguf", "main"),
+                    Which::W3_5_27b => (
+                        "unsloth/Qwen3.5-27B-GGUF",
+                        "Qwen3.5-27B-Q4_K_M.gguf",
                         "main",
                     ),
                 };
@@ -213,14 +182,6 @@ fn main() -> anyhow::Result<()> {
         args.temperature, args.repeat_penalty, args.repeat_last_n
     );
 
-    let dtype = match args.dtype.as_str() {
-        "bf16" => DType::BF16,
-        "f16" => DType::F16, // Used for V100
-        _ => {
-            panic!("Not supported dtype!")
-        }
-    };
-
     let model_path = args.model()?;
     let mut file = std::fs::File::open(&model_path)?;
     let start = std::time::Instant::now();
@@ -240,7 +201,7 @@ fn main() -> anyhow::Result<()> {
             format_size(total_size_in_bytes),
             start.elapsed().as_secs_f32(),
         );
-        Qwen3_MoE::from_gguf(model, &mut file, &device, dtype)?
+        Qwen3_5::from_gguf(model, &mut file, &device)?
     };
     println!("model built");
 
@@ -307,7 +268,11 @@ fn main() -> anyhow::Result<()> {
         std::io::stdout().flush()?;
     }
 
-    let eos_token = *tos.tokenizer().get_vocab(true).get("<|im_end|>").unwrap();
+    let eos_token = *tos
+        .tokenizer()
+        .get_vocab(true)
+        .get("<|im_end|>")
+        .unwrap_or(&0);
 
     let start_post_prompt = std::time::Instant::now();
 

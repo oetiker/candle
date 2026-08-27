@@ -1,6 +1,6 @@
 use crate::source::{
     AFFINE, BINARY, CAST, CONV, FILL, GEMV, INDEXING, MLX_GEMM, MLX_SORT, QUANTIZED, RANDOM,
-    REDUCE, SDPA, SORT, TERNARY, UNARY,
+    GATED_DELTA, REDUCE, SDPA, SORT, TERNARY, UNARY,
 };
 use crate::utils::get_env_bool;
 use crate::{
@@ -59,7 +59,7 @@ impl From<String> for KernelName {
 }
 
 type Libraries = HashMap<Source, Library>;
-type Pipelines = HashMap<(KernelName, Option<ConstantValues>), ComputePipeline>;
+type Pipelines = HashMap<(Source, KernelName, Option<ConstantValues>), ComputePipeline>;
 
 #[derive(Debug)]
 pub struct Kernels {
@@ -90,6 +90,7 @@ impl Kernels {
             Source::Cast => CAST,
             Source::Conv => CONV,
             Source::Fill => FILL,
+            Source::GatedDelta => GATED_DELTA,
             Source::Gemm => MLX_GEMM,
             Source::Gemv => GEMV,
             Source::Indexing => INDEXING,
@@ -151,16 +152,16 @@ impl Kernels {
         constants: Option<ConstantValues>,
     ) -> Result<ComputePipeline, MetalKernelError> {
         let mut pipelines = self.pipelines.write()?;
-        let key = (name.into(), constants);
+        let key = (source, name.into(), constants);
         if let Some(pipeline) = pipelines.get(&key) {
             Ok(pipeline.clone())
         } else {
-            let (name, constants) = key;
+            let (source, name, constants) = key;
             let func = self.load_function(device, source, name.as_ref(), constants.as_ref())?;
             let pipeline = device
                 .new_compute_pipeline_state_with_function(&func)
                 .map_err(|e| MetalKernelError::FailedToCreatePipeline(e.to_string()))?;
-            pipelines.insert((name, constants), pipeline.clone());
+            pipelines.insert((source, name, constants), pipeline.clone());
 
             Ok(pipeline)
         }

@@ -3,6 +3,7 @@ pub mod binary;
 pub mod cast;
 pub mod convolution;
 pub mod fill;
+pub mod gated_delta;
 pub mod indexing;
 mod macros;
 pub mod mlx_gemm;
@@ -19,10 +20,12 @@ pub use binary::{call_binary_contiguous, call_binary_strided};
 pub use cast::{call_cast_contiguous, call_cast_strided};
 pub use convolution::*;
 pub use fill::*;
+pub use gated_delta::call_gated_delta;
 pub use indexing::*;
 pub use mlx_gemm::{call_mlx_gemm, call_mlx_gemv, GemmDType};
 pub use quantized::{
-    call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_t, GgmlDType,
+    call_quantized_get_rows, call_quantized_matmul_mm_t, call_quantized_matmul_mv_id,
+    call_quantized_matmul_mv_t, GgmlDType,
 };
 pub use random::*;
 pub use reduce::*;

@@ -777,9 +777,67 @@ impl QTensor {
                     panic!("Non-cuda indexed_moe_forward is not implemented!");
                 }
             },
-            _ => {
-                panic!("indexed_moe_forward is not implemented in this platform!");
+            QStorage::Metal(s) => match (&*x.storage(), &*ids.storage()) {
+                (Storage::Metal(x_storage), Storage::Metal(ids_storage)) => {
+                    let (storage, out_shape) = s.indexed_moe_forward(
+                        self.shape(),
+                        x_storage,
+                        x.layout(),
+                        ids_storage,
+                        ids.layout(),
+                    )?;
+                    Ok(crate::tensor::from_storage(
+                        Storage::Metal(storage),
+                        out_shape,
+                        crate::op::BackpropOp::none(),
+                        false,
+                    ))
+                }
+                _ => crate::bail!("indexed_moe_forward: x and ids must be on the Metal device"),
+            },
+            QStorage::Cpu(_) => {
+                crate::bail!("indexed_moe_forward is not implemented for the CPU backend")
             }
+        }
+    }
+
+    /// A `QTensor` of `shape` borrowing `size_in_bytes` bytes at `offset` inside this tensor's
+    /// storage, without copying. Metal only. Used to expose the individual experts of a stacked
+    /// `[n_experts, n, k]` MoE weight as `[n, k]` matrices while the stack itself stays live for
+    /// the fused kernel, so the expert weights are stored exactly once.
+    ///
+    /// Returns `None` when the backend cannot alias (CPU, CUDA) or the offset is not suitably
+    /// aligned, so the caller can fall back to copying rather than fail.
+    pub fn byte_view<S: Into<Shape>>(
+        &self,
+        offset: usize,
+        size_in_bytes: usize,
+        shape: S,
+    ) -> Result<Option<Self>> {
+        match &self.storage {
+            // 256 is one of the two alignments QMetalStorage::view enforces; check it here too so
+            // an unalignable layout becomes a fallback rather than an error. The block alignment
+            // is NOT downgraded to a fallback -- a mid-block offset is a caller bug, not a
+            // platform limitation, and it must not be papered over by silently copying.
+            QStorage::Metal(s) if offset.is_multiple_of(256) => {
+                let shape: Shape = shape.into();
+                // QTensor::new only checks dims against block_size. Nothing else would notice a
+                // size that disagrees with the shape, and every kernel sizes its reads from the
+                // SHAPE -- so a short view would be read past its end.
+                let block_size = s.dtype().block_size();
+                let type_size = s.dtype().type_size();
+                let expected = shape.elem_count() / block_size * type_size;
+                if size_in_bytes != expected {
+                    crate::bail!(
+                        "QTensor::byte_view: {size_in_bytes} bytes do not describe {shape:?} of \
+                         {:?} ({expected} bytes)",
+                        s.dtype()
+                    )
+                }
+                let storage = QStorage::Metal(s.view(offset, size_in_bytes)?);
+                Ok(Some(Self::new(storage, shape)?))
+            }
+            _ => Ok(None),
         }
     }
 
