@@ -162,6 +162,25 @@ impl ParamsConvTranspose2D {
 /// 4x is the largest ratio that still wins on both backends, so that is the cutoff.
 const DEPTHWISE_TAP_RATIO: usize = 4;
 
+/// Largest `k_size` at which `conv1d_depthwise`'s sequential tap summation is bit-identical
+/// (max abs diff `0.0`) to the reference `groups`-convolutions-plus-`cat` lowering.
+///
+/// Measured with `probe_accuracy_by_k` (cpu, M1 Max, f32, 64 channels, per-`k` random inputs
+/// compared against both the reference lowering and an independent f64 host evaluation):
+/// bit-identical to the reference lowering through `k=7` (max abs diff `0.0`), then diverges
+/// starting at `k=8` (max abs diff `4.77e-7` -- an 8-lane NEON summation-order boundary).
+/// `k=8` specifically was the untested gap between a previously-known-good `k=7` and a
+/// previously-known-bad `k=9`; measuring it landed the bound at `7`, not `8`.
+///
+/// The fast path is also measurably *less accurate* than the lowering it replaces once past
+/// this boundary: against an f64 host reference at `k=59` (a kernel size used by the ReDimNet
+/// speaker embedder, which takes this path via `groups == c`), the fast path's error is 2.08x
+/// that of the reference lowering (3.32e-6 vs 1.60e-6).
+///
+/// Qwen3.5's GatedDeltaNet -- the shape this fast path was built for -- uses `k_size == 4`,
+/// which is `<=` this bound and so is unaffected by the cap.
+const DEPTHWISE_BITEXACT_K_MAX: usize = 7;
+
 /// Whether the depthwise fast path can handle this 1d convolution.
 ///
 /// `params.c_in` / `params.c_out` are already per-group, so both being 1 is exactly
@@ -178,6 +197,10 @@ fn depthwise_1d_applicable(params: &ParamsConv1D, groups: usize) -> bool {
         // worse than simply leaving strided convolutions on the unchanged path).
         && params.stride == 1
         && params.k_size <= DEPTHWISE_TAP_RATIO * groups
+        // Accuracy cap, independent of the performance cutoff above: past this bound the
+        // fast path is no longer bit-identical to the reference lowering. See
+        // `DEPTHWISE_BITEXACT_K_MAX`.
+        && params.k_size <= DEPTHWISE_BITEXACT_K_MAX
         // Guard l_out() against underflow; let the reference path report the error.
         && params.l_in + 2 * params.padding >= params.dilation * (params.k_size - 1) + 1
 }
@@ -823,17 +846,33 @@ mod depthwise_tests {
     /// The exact boundary of the fast path.
     ///
     /// These assertions encode a *measured* policy, not a guess -- see
-    /// [`DEPTHWISE_TAP_RATIO`] for the table. Everything the predicate rejects keeps using
-    /// the unchanged reference lowering, and is checked here to still be numerically right.
+    /// [`DEPTHWISE_TAP_RATIO`] for the performance table and [`DEPTHWISE_BITEXACT_K_MAX`] for
+    /// the accuracy bound. Everything the predicate rejects keeps using the unchanged
+    /// reference lowering, and is checked here to still be numerically right.
     fn depthwise_dispatch_boundary(dev: &Device) -> Result<()> {
         // Depthwise, stride 1: the fast path, whatever the padding and dilation.
         assert!(depthwise_1d_applicable(&params_1d(1, 20, 4, 0, 1, 1), 4));
         assert!(depthwise_1d_applicable(&params_1d(1, 20, 3, 2, 1, 3), 8));
         assert!(depthwise_1d_applicable(&params_1d(1, 8, 4, 0, 1, 1), 6144));
 
-        // k_size == 4 * groups is the last measured win on both cpu and metal.
-        assert!(depthwise_1d_applicable(&params_1d(1, 40, 16, 0, 1, 1), 4));
-        // One tap further and the reference loop is cheaper.
+        // The ratio cutoff in isolation: with `groups == 1` the accuracy cap (7) never binds
+        // before the ratio boundary (`4 * groups == 4`) does, so this exercises
+        // `DEPTHWISE_TAP_RATIO` on its own. `k_size == 4 * groups` is the last measured win
+        // on both cpu and metal; one tap further and the reference loop is cheaper.
+        assert!(depthwise_1d_applicable(&params_1d(1, 20, 4, 0, 1, 1), 1));
+        assert!(!depthwise_1d_applicable(&params_1d(1, 20, 5, 0, 1, 1), 1));
+
+        // The accuracy cap in isolation: a huge `groups` satisfies the ratio check by a wide
+        // margin at both k, so this exercises `DEPTHWISE_BITEXACT_K_MAX` on its own.
+        // `conv1d_depthwise` is bit-identical to the reference lowering through k=7 and
+        // measurably diverges from k=8 -- see `DEPTHWISE_BITEXACT_K_MAX` for the measurement.
+        assert!(depthwise_1d_applicable(&params_1d(1, 20, 7, 0, 1, 1), 6144));
+        assert!(!depthwise_1d_applicable(&params_1d(1, 20, 8, 0, 1, 1), 6144));
+
+        // The old ratio-only boundary (k_size == 4 * groups, here 16 taps at groups=4) used to
+        // admit the fast path on performance grounds alone; it is now rejected by the accuracy
+        // cap despite satisfying the ratio, because 16 > `DEPTHWISE_BITEXACT_K_MAX`.
+        assert!(!depthwise_1d_applicable(&params_1d(1, 40, 16, 0, 1, 1), 4));
         assert!(!depthwise_1d_applicable(&params_1d(1, 40, 17, 0, 1, 1), 4));
 
         // stride > 1 needs a gather, which regresses on cpu (0.35-0.45x measured).
@@ -893,6 +932,43 @@ mod depthwise_tests {
         Ok(())
     }
 
+    /// Regression coverage above `DEPTHWISE_BITEXACT_K_MAX`.
+    ///
+    /// Everything up to this point (`CASES_1D`, `depthwise_dispatch_boundary`'s numeric
+    /// checks) only exercises k <= 4 with a 1e-5 tolerance, which is exactly why the fast
+    /// path's divergence from k=8 upward went unnoticed. This pins two things at k = 8, 9,
+    /// 11, 31, 59 (31 and 59 are kernel sizes the ReDimNet speaker embedder uses):
+    ///
+    /// - `depthwise_1d_applicable` rejects the fast path at every one of these k (with a
+    ///   `groups` large enough that the performance ratio cannot be why).
+    /// - The public `Tensor::conv1d` result is still numerically correct against an
+    ///   independent f64 host evaluation -- i.e. falling back is not itself a regression.
+    ///
+    /// If `DEPTHWISE_BITEXACT_K_MAX` is ever widened past the measured bound (or the check
+    /// removed), the `depthwise_1d_applicable` assertions below fail immediately.
+    fn depthwise_accuracy_above_bitexact_bound(dev: &Device) -> Result<()> {
+        let mut rng = Lcg::new(88);
+        for &k in &[8usize, 9, 11, 31, 59] {
+            let c = 16; // c == groups; 4 * c is far above every k here, so only the accuracy
+                        // cap -- not the performance ratio -- can be rejecting these.
+            let l_in = k + 23;
+            let params = params_1d(1, l_in, k, 0, 1, 1);
+            assert!(
+                !depthwise_1d_applicable(&params, c),
+                "k={k}: fast path must not be applicable above the bit-identical bound"
+            );
+            let x = rng.tensor((1, c, l_in), dev)?;
+            let w = rng.tensor((c, 1, k), dev)?;
+            let brute = brute_force_1d(&x, &w, &params)?;
+            let got = x.conv1d(&w, 0, 1, 1, c)?;
+            assert!(
+                max_abs_diff(&got, &brute)? <= 1e-4,
+                "k={k}: fall back above the bound must still be numerically correct"
+            );
+        }
+        Ok(())
+    }
+
     /// Grouped conv2d has no fast path -- measurement showed the tap formulation loses at
     /// the shapes that matter. This pins the unchanged lowering so the removal stays
     /// removed and the 2d loop keeps producing the right answer.
@@ -928,6 +1004,9 @@ mod depthwise_tests {
                 padding,
                 stride,
                 dilation,
+                // Per-group params for `brute_force_2d`, which never reads `groups` -- 1
+                // matches the `c_out`/`c_in` above (a single group's shape).
+                groups: 1,
                 cudnn_fwd_algo: None,
             };
             let got = x.conv2d(&k, padding, stride, dilation, c)?;
@@ -1009,6 +1088,12 @@ mod depthwise_tests {
         depthwise_dispatch_boundary_metal
     );
     test_device!(
+        depthwise_accuracy_above_bitexact_bound,
+        depthwise_accuracy_above_bitexact_bound_cpu,
+        depthwise_accuracy_above_bitexact_bound_gpu,
+        depthwise_accuracy_above_bitexact_bound_metal
+    );
+    test_device!(
         depthwise_conv2d_uses_unchanged_lowering,
         depthwise_conv2d_uses_unchanged_lowering_cpu,
         depthwise_conv2d_uses_unchanged_lowering_gpu,
@@ -1020,4 +1105,51 @@ mod depthwise_tests {
         depthwise_conv1d_backprop_gpu,
         depthwise_conv1d_backprop_metal
     );
+
+    /// Diagnostic probe, not a correctness check by itself (the boundary it demonstrates is
+    /// pinned by [`depthwise_dispatch_boundary`] and the accuracy loss above the bound is
+    /// pinned by [`depthwise_accuracy_above_bitexact_bound`]).
+    ///
+    /// For k = 3..=9, 11, prints:
+    /// - `applicable`: whether `depthwise_1d_applicable` admits the fast path at this k
+    ///   (with a `groups` large enough that the performance ratio never binds, isolating the
+    ///   accuracy cap).
+    /// - `fast_vs_ref` / `fast_vs_f64`: the fast path (`conv1d_depthwise`, called directly,
+    ///   bypassing the predicate) against the reference lowering and against an independent
+    ///   f64 host evaluation.
+    /// - `public_vs_f64`: the public `Tensor::conv1d` entry point (which *does* go through the
+    ///   predicate) against the same f64 reference -- this is the number that should stop
+    ///   tracking `fast_vs_f64` and start tracking `ref_vs_f64` once `applicable` goes false.
+    ///
+    /// This is what established `DEPTHWISE_BITEXACT_K_MAX = 7`: bit-identical (`fast_vs_ref ==
+    /// 0`) through k=7, diverging from k=8 -- k=8 specifically had never been measured before
+    /// (only k=7, bit-identical, and k=9, divergent, were on record).
+    #[test]
+    fn probe_accuracy_by_k() -> Result<()> {
+        let dev = Device::Cpu;
+        let mut rng = Lcg::new(12345);
+        // c == groups (depthwise); 4 * c is far above the k range probed here, so the ratio
+        // cutoff never binds and only the accuracy cap is being observed.
+        let c = 64;
+        println!("\nk | applicable | fast_vs_ref | fast_vs_f64 | ref_vs_f64 | public_vs_f64");
+        for k in [3usize, 4, 5, 6, 7, 8, 9, 11] {
+            let l_in = k + 37;
+            let x = rng.tensor((1, c, l_in), &dev)?;
+            let w = rng.tensor((c, 1, k), &dev)?;
+            let params = params_1d(1, l_in, k, 0, 1, 1);
+            let applicable = depthwise_1d_applicable(&params, c);
+            let fast = x.conv1d_depthwise(&w, &params)?;
+            let refr = x.conv1d_grouped_loop(&w, &params, c)?;
+            let brute = brute_force_1d(&x, &w, &params)?;
+            let public = x.conv1d(&w, 0, 1, 1, c)?;
+            let d_fast_ref = max_abs_diff(&fast, &refr)?;
+            let d_fast_f64 = max_abs_diff(&fast, &brute)?;
+            let d_ref_f64 = max_abs_diff(&refr, &brute)?;
+            let d_public_f64 = max_abs_diff(&public, &brute)?;
+            println!(
+                "k={k}: applicable={applicable} fast_vs_ref={d_fast_ref:e} fast_vs_f64={d_fast_f64:e} ref_vs_f64={d_ref_f64:e} public_vs_f64={d_public_f64:e}"
+            );
+        }
+        Ok(())
+    }
 }
