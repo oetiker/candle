@@ -24,6 +24,14 @@ impl QMetalStorage {
         Err(Error::NotCompiledWithMetalSupport)
     }
 
+    // Present only so `QTensor::byte_view` COMPILES without the metal feature -- its Metal arm
+    // calls this, and the whole file is the not-compiled-with-metal stub, so no caller can ever
+    // hold a real one to reach it. Without this method candle-core does not build at all on the
+    // CPU-only configuration, which is what non-Apple CI and a CPU bit-identity gate need.
+    pub fn view(&self, _offset: usize, _size: usize) -> Result<Self> {
+        Err(Error::NotCompiledWithMetalSupport)
+    }
+
     pub fn quantize(&mut self, _src: &MetalStorage) -> Result<()> {
         Err(Error::NotCompiledWithMetalSupport)
     }
