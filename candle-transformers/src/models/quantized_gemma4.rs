@@ -423,15 +423,42 @@ fn rms_norm_plain(x: &Tensor, eps: f64) -> Result<Tensor> {
     x.broadcast_div(&(ms + eps)?.sqrt()?)?.to_dtype(dt)
 }
 
+/// Queries per attention block (llama.cpp's default `n_ubatch`). Scores are `[b, heads, block,
+/// keys]`, so a long prefill never materialises `[b, heads, L, keys]`: at L = keys = 5224 with
+/// 32 heads that is ~3.5 GB f32 per layer, plus the mask-add and softmax copies (Metal OOM).
+pub(crate) const ATTN_Q_BLOCK: usize = 512;
+
 /// Scale 1.0: Gemma 4 relies on q_norm/k_norm (gemma4.cpp `f_attention_scale = 1.0f`).
-fn attend(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>, n_rep: usize) -> Result<Tensor> {
+/// `mask` is `[b, 1, L, keys]` (a broadcast view); softmax is per query row, so attending
+/// `q_block` query rows at a time equals the unblocked result.
+fn attend(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>, n_rep: usize, q_block: usize) -> Result<Tensor> {
+    if q_block == 0 {
+        candle::bail!("attention query block must be at least 1")
+    }
     let k = repeat_kv(k.clone(), n_rep)?.contiguous()?;
     let v = repeat_kv(v.clone(), n_rep)?.contiguous()?;
-    let mut scores = q.contiguous()?.matmul(&k.t()?)?;
-    if let Some(m) = mask {
-        scores = scores.broadcast_add(m)?;
+    let kt = k.t()?;
+    let l = q.dim(2)?;
+    let mut blocks = Vec::with_capacity(l.div_ceil(q_block));
+    let mut start = 0;
+    while start < l {
+        // A lone trailing row joins this block: a 1-row matmul takes the CPU gemm's m = 1
+        // path, which rounds differently from the unblocked multi-row product.
+        let len = match l - start {
+            rest if rest == q_block + 1 => rest,
+            rest => rest.min(q_block),
+        };
+        let mut scores = q.narrow(2, start, len)?.contiguous()?.matmul(&kt)?;
+        if let Some(m) = mask {
+            scores = scores.broadcast_add(&m.narrow(2, start, len)?)?;
+        }
+        blocks.push(candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?);
+        start += len;
     }
-    candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)
+    match blocks.len() {
+        1 => Ok(blocks.remove(0)),
+        _ => Tensor::cat(&blocks, 2),
+    }
 }
 
 struct Masks {
@@ -464,7 +491,7 @@ struct Attention {
 }
 
 impl Attention {
-    fn forward(&mut self, x: &Tensor, offset: usize, masks: &Masks) -> Result<Tensor> {
+    fn forward(&mut self, x: &Tensor, offset: usize, masks: &Masks, q_block: usize) -> Result<Tensor> {
         let (b, l, _) = x.dims3()?;
         let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
         let q = self.q_proj.forward(x)?.reshape((b, l, nh, hd))?;
@@ -479,7 +506,7 @@ impl Attention {
         let k = self.rope.apply(&self.k_norm.forward(&k)?.transpose(1, 2)?, offset)?;
         let v = rms_norm_plain(&v_raw.reshape((b, l, nkv, hd))?, self.eps)?.transpose(1, 2)?.contiguous()?;
         let (keys, values, mask) = self.store(k, v, offset, l, masks)?;
-        let ctx = attend(&q, &keys, &values, mask.as_ref(), nh / nkv)?;
+        let ctx = attend(&q, &keys, &values, mask.as_ref(), nh / nkv, q_block)?;
         self.o_proj.forward(&ctx.transpose(1, 2)?.reshape((b, l, nh * hd))?)
     }
 
@@ -571,8 +598,8 @@ struct Layer {
 }
 
 impl Layer {
-    fn forward(&mut self, x: &Tensor, offset: usize, masks: &Masks) -> Result<Tensor> {
-        let a = self.attn.forward(&self.attn_norm.forward(x)?, offset, masks)?;
+    fn forward(&mut self, x: &Tensor, offset: usize, masks: &Masks, q_block: usize) -> Result<Tensor> {
+        let a = self.attn.forward(&self.attn_norm.forward(x)?, offset, masks, q_block)?;
         let h = (self.post_attn_norm.forward(&a)? + x)?;
         let f = self.mlp.forward(&self.ffn_norm.forward(&h)?)?;
         let out = (self.post_ffw_norm.forward(&f)? + &h)?;
@@ -740,6 +767,11 @@ impl ModelWeights {
     /// Logits of the last position, `[b, vocab]`, softcapped. After an error the state is
     /// undefined: call [`ModelWeights::clear_kv_cache`] or restore a snapshot.
     pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        self.forward_blocked(input, offset, ATTN_Q_BLOCK)
+    }
+
+    /// [`ModelWeights::forward`] with attention over blocks of at most `q_block` queries.
+    fn forward_blocked(&mut self, input: &Tensor, offset: usize, q_block: usize) -> Result<Tensor> {
         if offset != self.pos {
             candle::bail!(
                 "forward at position {offset}, but the model's state ends at {}: a snapshot restored \
@@ -751,7 +783,7 @@ impl ModelWeights {
         let masks = self.masks(b, l, offset)?;
         let mut h = (self.embed.forward(input)? * self.embed_scale)?;
         for layer in &mut self.layers {
-            h = layer.forward(&h, offset, &masks)?;
+            h = layer.forward(&h, offset, &masks, q_block)?;
         }
         self.pos = offset + l;
         let h = self.norm.forward(&h.narrow(1, l - 1, 1)?)?;
@@ -1205,6 +1237,40 @@ mod model_tests {
         assert!(max_diff(&one_shot, &chunked) < 1e-4, "{}", max_diff(&one_shot, &chunked));
         let v = vec(&one_shot);
         assert!(v.iter().any(|&a| (a - v[0]).abs() > 1e-3), "degenerate logits prove nothing");
+    }
+
+    /// Forward `ids` in `chunk`-token forwards with attention over `q_block`-query blocks;
+    /// the logits after every forward.
+    fn run_blocked(m: &mut ModelWeights, ids: &[u32], start: usize, chunk: usize, q_block: usize) -> Vec<Vec<f32>> {
+        let mut pos = start;
+        let mut out = vec![];
+        for c in ids.chunks(chunk) {
+            let t = Tensor::new(c, &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+            out.push(vec(&m.forward_blocked(&t, pos, q_block).unwrap()));
+            pos += c.len();
+        }
+        out
+    }
+
+    /// Query-row blocking must not change a single bit: a prefill longer than the window, a
+    /// second multi-token chunk after a cached prefix, then decode, with blocks of 2 and 3
+    /// (neither divides 11 or 7; both leave a lone trailing row somewhere) against one block
+    /// covering every query.
+    #[test]
+    fn query_blocked_attention_is_bit_identical_to_unblocked() {
+        let (prefix, suffix, tail) = (ids(11, 0), ids(7, 9), ids(2, 4));
+        let steps = |q_block: usize| {
+            let mut m = model();
+            let mut out = run_blocked(&mut m, &prefix, 0, 11, q_block);
+            out.extend(run_blocked(&mut m, &suffix, 11, 7, q_block));
+            out.extend(run_blocked(&mut m, &tail, 18, 1, q_block));
+            out
+        };
+        let whole = steps(tiny::CONTEXT);
+        assert!(whole[0].iter().any(|&a| (a - whole[0][0]).abs() > 1e-3), "degenerate logits prove nothing");
+        for q_block in [2, 3] {
+            assert_eq!(steps(q_block), whole, "q_block {q_block}");
+        }
     }
 
     #[test]
