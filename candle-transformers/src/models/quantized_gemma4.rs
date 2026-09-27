@@ -1293,6 +1293,14 @@ mod model_tests {
     fn softcapped_logits_stay_within_the_cap() {
         let l = run(&mut model(), &ids(5, 0), 0, 5);
         assert!(vec(&l).iter().all(|x| x.abs() <= 30.0));
+        // The tiny model's raw logits sit far below 30, so the bound alone cannot tell a missing
+        // softcap apart: check the exact `tanh(x / 30) * 30` mapping of the uncapped logits too.
+        let mut uncapped = model();
+        uncapped.softcap = None;
+        let raw = run(&mut uncapped, &ids(5, 0), 0, 5);
+        let expect = ((&raw / 30.0).unwrap().tanh().unwrap() * 30.0).unwrap();
+        assert!(max_diff(&l, &expect) < 1e-5, "{}", max_diff(&l, &expect));
+        assert!(max_diff(&l, &raw) > 1e-4, "the cap must change the logits: {}", max_diff(&l, &raw));
     }
 
     #[test]
