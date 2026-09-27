@@ -19,7 +19,7 @@
 //! embeddings, shared KV layers or a vision/audio tower is REFUSED, never silently half-loaded.
 
 use candle::quantized::gguf_file;
-use candle::Result;
+use candle::{Result, Tensor};
 use std::collections::HashMap;
 
 pub const ARCH: &str = "gemma4";
@@ -226,6 +226,139 @@ pub fn check_supported(ct: &gguf_file::Content) -> Result<()> {
         candle::bail!("vision/audio tower tensors are present ({n}); only the text tower is supported")
     }
     Ok(())
+}
+
+/// A full ring (`window` slots, position `p` in slot `p % window`) in chronological order. A
+/// buffer that has not filled yet is already chronological and comes back as is.
+fn ring_to_chronological(buf: &Tensor, write_pos: usize, window: usize) -> Result<Tensor> {
+    let n = buf.dim(2)?;
+    if n < window {
+        if write_pos != n {
+            candle::bail!(
+                "a sliding buffer holding {n} of {window} slots must be written at slot {n}, not {write_pos}"
+            )
+        }
+        return Ok(buf.clone());
+    }
+    if n != window {
+        candle::bail!("a sliding buffer holds {n} slots, more than its window {window}")
+    }
+    if write_pos == 0 {
+        return Ok(buf.clone());
+    }
+    Tensor::cat(&[&buf.narrow(2, write_pos, window - write_pos)?, &buf.narrow(2, 0, write_pos)?], 2)
+}
+
+/// Keep the last `window` of `chrono` (whose last key is position `end_offset - 1`) as a ring.
+/// Returns the ring and its write position (`end_offset % window`).
+fn chronological_to_ring(chrono: &Tensor, end_offset: usize, window: usize) -> Result<(Tensor, usize)> {
+    let total = chrono.dim(2)?;
+    if total > end_offset {
+        candle::bail!("{total} keys cannot end at position {end_offset}")
+    }
+    let n = total.min(window);
+    let tail = chrono.narrow(2, total - n, n)?;
+    if n < window {
+        if end_offset != n {
+            candle::bail!("{n} keys kept after {end_offset} positions: a filled window cannot shrink")
+        }
+        return Ok((tail.contiguous()?, end_offset % window));
+    }
+    // tail[i] is position end_offset - window + i, which belongs in slot (s0 + i) % window.
+    let s0 = (end_offset - window) % window;
+    let ring = if s0 == 0 {
+        tail.contiguous()?
+    } else {
+        Tensor::cat(&[&tail.narrow(2, window - s0, s0)?, &tail.narrow(2, 0, window - s0)?], 2)?
+    };
+    Ok((ring, end_offset % window))
+}
+
+/// `l x n` additive mask: queries at positions `q_start..q_start+l`, keys at `k_start..k_start+n`.
+/// Visible iff the key is not in the future and, with a window, `q - k < window`
+/// (llama.cpp `LLAMA_SWA_TYPE_STANDARD`: `p1 - p0 >= n_swa` is masked).
+fn mask_values(q_start: usize, l: usize, k_start: usize, n: usize, window: Option<usize>) -> Vec<f32> {
+    let mut m = Vec::with_capacity(l * n);
+    for i in 0..l {
+        let q = q_start + i;
+        for j in 0..n {
+            let k = k_start + j;
+            let visible = k <= q && window.is_none_or(|w| q - k < w);
+            m.push(if visible { 0.0 } else { f32::NEG_INFINITY });
+        }
+    }
+    m
+}
+
+/// A sliding state must say where it is: `slots == min(offset, window)` and
+/// `write_pos == offset % window`. Restoring the tensors of a wrapped ring without its position
+/// is exactly what silently broke the Python rig on 2026-09-25; here it is an error.
+fn check_sliding_state(
+    layer: usize,
+    k: &Option<Tensor>,
+    v: &Option<Tensor>,
+    write_pos: usize,
+    offset: usize,
+    window: usize,
+) -> Result<()> {
+    let slots = match (k, v) {
+        (None, None) => 0,
+        (Some(k), Some(v)) => {
+            if k.dims() != v.dims() {
+                candle::bail!("layer {layer}: sliding K {:?} and V {:?} differ in shape", k.dims(), v.dims())
+            }
+            k.dim(2)?
+        }
+        _ => candle::bail!("layer {layer}: sliding state is half-set; K and V must both be Some or both None"),
+    };
+    if slots != offset.min(window) || write_pos != offset % window {
+        candle::bail!(
+            "layer {layer}: sliding state is inconsistent: {slots} slots, write_pos {write_pos}, \
+             offset {offset}, window {window} (expected {} slots, write_pos {})",
+            offset.min(window),
+            offset % window
+        )
+    }
+    Ok(())
+}
+
+/// One layer's inference state, public so `s2t-llm` can snapshot and restore a prompt prefix.
+///
+/// `Sliding` carries its ring's write position and the absolute number of positions seen, BY
+/// CONSTRUCTION -- the tensors alone do not say which slot is oldest once the ring has wrapped.
+/// The tensors returned by [`ModelWeights::layer_states`] SHARE storage with the model, and the
+/// sliding ring is overwritten IN PLACE on decode: keep a snapshot only via [`LayerState::deep_copy`].
+#[derive(Debug, Clone)]
+pub enum LayerState {
+    Sliding { k: Option<Tensor>, v: Option<Tensor>, write_pos: usize, offset: usize },
+    Full { k: Option<Tensor>, v: Option<Tensor> },
+}
+
+impl LayerState {
+    pub fn size_in_bytes(&self) -> usize {
+        let t = |o: &Option<Tensor>| o.as_ref().map(|t| t.elem_count() * t.dtype().size_in_bytes()).unwrap_or(0);
+        match self {
+            Self::Sliding { k, v, .. } | Self::Full { k, v } => t(k) + t(v),
+        }
+    }
+
+    pub fn deep_copy(&self) -> Result<Self> {
+        let c = |o: &Option<Tensor>| -> Result<Option<Tensor>> { o.as_ref().map(|t| t.copy()).transpose() };
+        Ok(match self {
+            Self::Sliding { k, v, write_pos, offset } => {
+                Self::Sliding { k: c(k)?, v: c(v)?, write_pos: *write_pos, offset: *offset }
+            }
+            Self::Full { k, v } => Self::Full { k: c(k)?, v: c(v)? },
+        })
+    }
+
+    /// Positions this layer has consumed.
+    pub fn position(&self) -> Result<usize> {
+        match self {
+            Self::Sliding { offset, .. } => Ok(*offset),
+            Self::Full { k, .. } => Ok(k.as_ref().map(|t| t.dim(2)).transpose()?.unwrap_or(0)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -458,5 +591,82 @@ mod config_tests {
         let (ct, _) = tiny::content(&Tiny { omit_key: Some("rope.freq_base_swa"), ..Tiny::default() });
         let e = Gemma4Config::from_metadata(&ct.metadata).unwrap_err().to_string();
         assert!(e.contains("gemma4.rope.freq_base_swa"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod ring_tests {
+    use super::*;
+    use candle::{Device, Tensor};
+
+    /// `[1, 1, n, 1]` whose values are the absolute positions `start..start+n`.
+    fn positions(start: usize, n: usize) -> Tensor {
+        let v: Vec<f32> = (start..start + n).map(|p| p as f32).collect();
+        Tensor::from_vec(v, (1, 1, n, 1), &Device::Cpu).unwrap()
+    }
+
+    fn values(t: &Tensor) -> Vec<usize> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap().iter().map(|&x| x as usize).collect()
+    }
+
+    #[test]
+    fn the_ring_keeps_the_last_window_positions_each_in_its_modulo_slot() {
+        let w = 4;
+        for end in [1usize, 3, 4, 5, 7, 8, 9, 13] {
+            // up to two positions MORE than the window, to exercise the trim
+            let total = end.min(w + 2);
+            let (ring, wp) = chronological_to_ring(&positions(end - total, total), end, w).unwrap();
+            assert_eq!(wp, end % w, "end={end}");
+            let slots = values(&ring);
+            assert_eq!(slots.len(), end.min(w), "end={end}");
+            if end >= w {
+                for (s, p) in slots.iter().enumerate() {
+                    assert_eq!(p % w, s, "end={end}: position {p} must sit in slot {}", p % w);
+                }
+            }
+            let back = values(&ring_to_chronological(&ring, wp, w).unwrap());
+            let expect: Vec<usize> = (end - end.min(w)..end).collect();
+            assert_eq!(back, expect, "end={end}");
+        }
+    }
+
+    #[test]
+    fn a_short_buffer_written_elsewhere_than_its_end_is_rejected() {
+        assert!(ring_to_chronological(&positions(0, 2), 1, 4).is_err());
+    }
+
+    #[test]
+    fn the_sliding_mask_admits_exactly_window_positions_including_self() {
+        // query at position 5, window 4: keys 2..=5 visible; 1 (5-1 = 4 back) and 6 (future) not.
+        let m = mask_values(5, 1, 0, 7, Some(4));
+        let visible: Vec<usize> = (0..7).filter(|&j| m[j] == 0.0).collect();
+        assert_eq!(visible, vec![2, 3, 4, 5]);
+        let causal = mask_values(5, 1, 0, 7, None);
+        assert_eq!((0..7).filter(|&j| causal[j] == 0.0).count(), 6);
+    }
+
+    #[test]
+    fn check_sliding_state_accepts_only_consistent_positions() {
+        let t = |n| Some(positions(0, n));
+        assert!(check_sliding_state(0, &None, &None, 0, 0, 4).is_ok());
+        assert!(check_sliding_state(0, &t(3), &t(3), 3, 3, 4).is_ok());
+        assert!(check_sliding_state(0, &t(4), &t(4), 3, 7, 4).is_ok());
+        // the 2026-09-25 Python failure shape: right tensors, wrong position
+        assert!(check_sliding_state(0, &t(4), &t(4), 0, 7, 4).is_err());
+        assert!(check_sliding_state(0, &t(4), &t(4), 3, 6, 4).is_err());
+        assert!(check_sliding_state(0, &t(4), &None, 3, 7, 4).is_err());
+        assert!(check_sliding_state(0, &t(3), &t(3), 3, 7, 4).is_err());
+    }
+
+    #[test]
+    fn deep_copy_shares_no_storage_with_an_in_place_ring_write() {
+        let k = positions(0, 4).contiguous().unwrap();
+        let s = LayerState::Sliding { k: Some(k.clone()), v: Some(k.clone()), write_pos: 0, offset: 4 };
+        let copy = s.deep_copy().unwrap();
+        k.slice_set(&positions(99, 1), 2, 0).unwrap();
+        let LayerState::Sliding { k: Some(ck), write_pos, offset, .. } = copy else { panic!() };
+        assert_eq!(values(&ck), vec![0, 1, 2, 3]);
+        assert_eq!((write_pos, offset), (0, 4));
+        assert_eq!(s.position().unwrap(), 4);
     }
 }
