@@ -18,9 +18,16 @@
 //! Only the dense text tower: a checkpoint whose metadata or tensors enable MoE, per-layer-input
 //! embeddings, shared KV layers or a vision/audio tower is REFUSED, never silently half-loaded.
 
-use candle::quantized::gguf_file;
-use candle::{Result, Tensor};
+use super::with_tracing::QMatMul;
+use crate::quantized_nn::RmsNorm;
+use crate::utils::repeat_kv;
+use candle::quantized::{gguf_file, QTensor};
+use candle::{DType, Device, Module, Result, Tensor, D};
+use candle_nn::kv_cache::ConcatKvCache;
+use candle_nn::Embedding;
 use std::collections::HashMap;
+use std::io::{Read, Seek};
+use std::sync::Arc;
 
 pub const ARCH: &str = "gemma4";
 
@@ -150,6 +157,10 @@ impl Gemma4Config {
         if matches!(m.get(&key("feed_forward_length")), Some(gguf_file::Value::Array(_))) {
             candle::bail!("a per-layer feed_forward_length (use_double_wide_mlp) is not supported")
         }
+        let sliding_window = md_usize(m, "attention.sliding_window")?;
+        if sliding_window == 0 {
+            candle::bail!("{} is 0; the sliding layers need a window of at least 1", key("attention.sliding_window"))
+        }
         let final_logit_softcapping = match m.get(&key("final_logit_softcapping")) {
             None => None,
             Some(v) => Some(v.to_f32()? as f64),
@@ -163,7 +174,7 @@ impl Gemma4Config {
             key_length,
             key_length_swa,
             is_swa: md_per_layer_bool(m, "attention.sliding_window_pattern", n)?,
-            sliding_window: md_usize(m, "attention.sliding_window")?,
+            sliding_window,
             rms_norm_eps: md_f64(m, "attention.layer_norm_rms_epsilon")?,
             rope_freq_base: md_f64(m, "rope.freq_base")?,
             // REQUIRED, not defaulted: llama.cpp falls back to rope.freq_base when this key is
@@ -358,6 +369,464 @@ impl LayerState {
             Self::Sliding { offset, .. } => Ok(*offset),
             Self::Full { k, .. } => Ok(k.as_ref().map(|t| t.dim(2)).transpose()?.unwrap_or(0)),
         }
+    }
+}
+
+/// RoPE sin/cos tables, built in f32 (the Qwen3.5 port measured what an f16 angle table does at
+/// position 5304: a random rotation). NEOX layout via `candle_nn::rotary_emb::rope`, as llama.cpp
+/// uses for gemma4 (`LLAMA_ROPE_TYPE_NEOX`).
+#[derive(Debug, Clone)]
+struct Rope {
+    sin: Tensor,
+    cos: Tensor,
+}
+
+impl Rope {
+    /// `inv_freq[i] = 1 / (base^(2i/n_rot) * freq_factor[i])` -- ggml's `theta / freq_factor`.
+    fn new(n_rot: usize, base: f64, freq_factors: Option<&[f32]>, max_pos: usize, dev: &Device) -> Result<Self> {
+        let half = n_rot / 2;
+        if let Some(ff) = freq_factors {
+            if ff.len() != half {
+                candle::bail!("rope_freqs has {} entries, a {n_rot}-dim rotary needs {half}", ff.len())
+            }
+        }
+        let inv: Vec<f32> = (0..half)
+            .map(|i| {
+                let ff = freq_factors.map_or(1.0, |f| f[i] as f64);
+                (1.0 / (base.powf(2.0 * i as f64 / n_rot as f64) * ff)) as f32
+            })
+            .collect();
+        let inv = Tensor::from_vec(inv, (1, half), dev)?;
+        let t = Tensor::arange(0u32, max_pos as u32, dev)?.to_dtype(DType::F32)?.reshape((max_pos, 1))?;
+        let freqs = t.matmul(&inv)?;
+        Ok(Self { sin: freqs.sin()?, cos: freqs.cos()? })
+    }
+
+    /// `x` is `[b, heads, l, head_dim]`.
+    fn apply(&self, x: &Tensor, offset: usize) -> Result<Tensor> {
+        let l = x.dim(2)?;
+        let max = self.cos.dim(0)?;
+        if offset + l > max {
+            candle::bail!("position {} is beyond the {max} positions the RoPE tables hold (MAX_POSITIONS)", offset + l)
+        }
+        let cos = self.cos.narrow(0, offset, l)?.to_dtype(x.dtype())?;
+        let sin = self.sin.narrow(0, offset, l)?.to_dtype(x.dtype())?;
+        candle_nn::rotary_emb::rope(&x.contiguous()?, &cos, &sin)
+    }
+}
+
+/// RMS norm without a learned weight (gemma4.cpp: `ggml_rms_norm(Vcur, eps)`).
+fn rms_norm_plain(x: &Tensor, eps: f64) -> Result<Tensor> {
+    let dt = x.dtype();
+    let x = x.to_dtype(DType::F32)?;
+    let ms = x.sqr()?.mean_keepdim(D::Minus1)?;
+    x.broadcast_div(&(ms + eps)?.sqrt()?)?.to_dtype(dt)
+}
+
+/// Scale 1.0: Gemma 4 relies on q_norm/k_norm (gemma4.cpp `f_attention_scale = 1.0f`).
+fn attend(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>, n_rep: usize) -> Result<Tensor> {
+    let k = repeat_kv(k.clone(), n_rep)?.contiguous()?;
+    let v = repeat_kv(v.clone(), n_rep)?.contiguous()?;
+    let mut scores = q.contiguous()?.matmul(&k.t()?)?;
+    if let Some(m) = mask {
+        scores = scores.broadcast_add(m)?;
+    }
+    candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)
+}
+
+struct Masks {
+    full: Option<Tensor>,
+    sliding: Option<Tensor>,
+}
+
+#[derive(Debug, Clone)]
+enum KvState {
+    Sliding { k: Option<Tensor>, v: Option<Tensor>, write_pos: usize, offset: usize },
+    Full(ConcatKvCache),
+}
+
+#[derive(Debug, Clone)]
+struct Attention {
+    q_proj: QMatMul,
+    k_proj: QMatMul,
+    /// `None` = attention_k_eq_v: V is the raw K projection.
+    v_proj: Option<QMatMul>,
+    o_proj: QMatMul,
+    q_norm: RmsNorm,
+    k_norm: RmsNorm,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    eps: f64,
+    window: usize,
+    rope: Arc<Rope>,
+    kv: KvState,
+}
+
+impl Attention {
+    fn forward(&mut self, x: &Tensor, offset: usize, masks: &Masks) -> Result<Tensor> {
+        let (b, l, _) = x.dims3()?;
+        let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
+        let q = self.q_proj.forward(x)?.reshape((b, l, nh, hd))?;
+        let q = self.rope.apply(&self.q_norm.forward(&q)?.transpose(1, 2)?, offset)?;
+        let k_raw = self.k_proj.forward(x)?;
+        // k_eq_v: gemma4.cpp assigns `Vcur = Kcur` BEFORE k_norm and RoPE touch Kcur.
+        let v_raw = match &self.v_proj {
+            Some(v) => v.forward(x)?,
+            None => k_raw.clone(),
+        };
+        let k = k_raw.reshape((b, l, nkv, hd))?;
+        let k = self.rope.apply(&self.k_norm.forward(&k)?.transpose(1, 2)?, offset)?;
+        let v = rms_norm_plain(&v_raw.reshape((b, l, nkv, hd))?, self.eps)?.transpose(1, 2)?.contiguous()?;
+        let (keys, values, mask) = self.store(k, v, offset, l, masks)?;
+        let ctx = attend(&q, &keys, &values, mask.as_ref(), nh / nkv)?;
+        self.o_proj.forward(&ctx.transpose(1, 2)?.reshape((b, l, nh * hd))?)
+    }
+
+    /// Store this forward's K/V; return what the queries attend over and the mask for it.
+    fn store(&mut self, k: Tensor, v: Tensor, offset: usize, l: usize, masks: &Masks) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+        let window = self.window;
+        match &mut self.kv {
+            KvState::Full(cache) => {
+                let (k, v) = cache.append(&k, &v)?;
+                Ok((k, v, masks.full.clone()))
+            }
+            KvState::Sliding { k: sk, v: sv, write_pos, offset: seen } => {
+                if *seen != offset {
+                    candle::bail!("sliding layer has seen {seen} positions but this forward starts at {offset}")
+                }
+                let ring_is_full = match sk.as_ref() {
+                    Some(t) => t.dim(2)? == window,
+                    None => false,
+                };
+                if l == 1 && ring_is_full {
+                    // Decode: overwrite the oldest slot IN PLACE. Every key left is within the
+                    // window of this query, so no mask; attention is order-independent.
+                    let (Some(rk), Some(rv)) = (sk.as_ref(), sv.as_ref()) else {
+                        candle::bail!("sliding state is half-set")
+                    };
+                    rk.slice_set(&k, 2, *write_pos)?;
+                    rv.slice_set(&v, 2, *write_pos)?;
+                    *write_pos = (*write_pos + 1) % window;
+                    *seen += 1;
+                    return Ok((rk.clone(), rv.clone(), None));
+                }
+                let (kc, vc) = match (sk.take(), sv.take()) {
+                    (Some(rk), Some(rv)) => (
+                        Tensor::cat(&[&ring_to_chronological(&rk, *write_pos, window)?, &k], 2)?,
+                        Tensor::cat(&[&ring_to_chronological(&rv, *write_pos, window)?, &v], 2)?,
+                    ),
+                    (None, None) => (k, v),
+                    _ => candle::bail!("sliding state is half-set"),
+                };
+                if kc.dim(2)? != offset.min(window) + l {
+                    candle::bail!("sliding keys {} != min(offset {offset}, window {window}) + {l}", kc.dim(2)?)
+                }
+                let end = offset + l;
+                let (rk, wp) = chronological_to_ring(&kc, end, window)?;
+                let (rv, _) = chronological_to_ring(&vc, end, window)?;
+                *sk = Some(rk);
+                *sv = Some(rv);
+                *write_pos = wp;
+                *seen = end;
+                Ok((kc, vc, masks.sliding.clone()))
+            }
+        }
+    }
+
+    fn clear(&mut self) {
+        match &mut self.kv {
+            KvState::Full(c) => c.reset(),
+            KvState::Sliding { k, v, write_pos, offset } => {
+                (*k, *v, *write_pos, *offset) = (None, None, 0, 0);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Mlp {
+    gate: QMatMul,
+    up: QMatMul,
+    down: QMatMul,
+}
+
+impl Module for Mlp {
+    /// gelu (tanh approximation, = ggml_gelu / `gelu_pytorch_tanh`) gated, LLM_FFN_PAR.
+    fn forward(&self, x: &Tensor) -> Result<Tensor> {
+        let g = self.gate.forward(x)?.gelu()?;
+        self.down.forward(&(g * self.up.forward(x)?)?)
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Layer {
+    attn_norm: RmsNorm,
+    attn: Attention,
+    post_attn_norm: RmsNorm,
+    ffn_norm: RmsNorm,
+    mlp: Mlp,
+    post_ffw_norm: RmsNorm,
+    out_scale: Option<Tensor>,
+}
+
+impl Layer {
+    fn forward(&mut self, x: &Tensor, offset: usize, masks: &Masks) -> Result<Tensor> {
+        let a = self.attn.forward(&self.attn_norm.forward(x)?, offset, masks)?;
+        let h = (self.post_attn_norm.forward(&a)? + x)?;
+        let f = self.mlp.forward(&self.ffn_norm.forward(&h)?)?;
+        let out = (self.post_ffw_norm.forward(&f)? + &h)?;
+        match &self.out_scale {
+            Some(s) => out.broadcast_mul(s),
+            None => Ok(out),
+        }
+    }
+}
+
+struct Loader<'a, R: Read + Seek> {
+    ct: &'a gguf_file::Content,
+    reader: &'a mut R,
+    device: &'a Device,
+}
+
+impl<R: Read + Seek> Loader<'_, R> {
+    fn has(&self, name: &str) -> bool {
+        self.ct.tensor_infos.contains_key(name)
+    }
+
+    fn qtensor(&mut self, name: &str) -> Result<QTensor> {
+        self.ct.tensor(self.reader, name, self.device)
+    }
+
+    fn qmatmul(&mut self, name: &str, out: usize, inp: usize) -> Result<QMatMul> {
+        let t = self.qtensor(name)?;
+        if t.shape().dims() != [out, inp] {
+            candle::bail!("{name} has shape {:?}, expected [{out}, {inp}]", t.shape().dims())
+        }
+        QMatMul::from_weights(Arc::new(t))
+    }
+
+    fn norm(&mut self, name: &str, dim: usize, eps: f64) -> Result<RmsNorm> {
+        let t = self.qtensor(name)?;
+        if t.shape().dims() != [dim] {
+            candle::bail!("{name} has shape {:?}, expected [{dim}]", t.shape().dims())
+        }
+        RmsNorm::from_qtensor(t, eps)
+    }
+
+    fn layer(&mut self, cfg: &Gemma4Config, i: usize, rope: Arc<Rope>) -> Result<Layer> {
+        let (h, ff, eps) = (cfg.embedding_length, cfg.feed_forward_length, cfg.rms_norm_eps);
+        let (hd, nh, nkv) = (cfg.head_dim(i), cfg.head_count[i], cfg.head_count_kv[i]);
+        if nkv == 0 || nh % nkv != 0 {
+            candle::bail!("layer {i}: {nh} query heads cannot share {nkv} KV heads")
+        }
+        let n = |s: &str| format!("blk.{i}.{s}.weight");
+        let v_proj = if self.has(&n("attn_v")) { Some(self.qmatmul(&n("attn_v"), nkv * hd, h)?) } else { None };
+        let kv = if cfg.is_swa[i] {
+            KvState::Sliding { k: None, v: None, write_pos: 0, offset: 0 }
+        } else {
+            KvState::Full(ConcatKvCache::new(2))
+        };
+        let attn = Attention {
+            q_proj: self.qmatmul(&n("attn_q"), nh * hd, h)?,
+            k_proj: self.qmatmul(&n("attn_k"), nkv * hd, h)?,
+            v_proj,
+            o_proj: self.qmatmul(&n("attn_output"), h, nh * hd)?,
+            q_norm: self.norm(&n("attn_q_norm"), hd, eps)?,
+            k_norm: self.norm(&n("attn_k_norm"), hd, eps)?,
+            n_heads: nh,
+            n_kv_heads: nkv,
+            head_dim: hd,
+            eps,
+            window: cfg.sliding_window,
+            rope,
+            kv,
+        };
+        let out_scale = if self.has(&n("layer_output_scale")) {
+            Some(self.qtensor(&n("layer_output_scale"))?.dequantize(self.device)?)
+        } else {
+            None
+        };
+        Ok(Layer {
+            attn_norm: self.norm(&n("attn_norm"), h, eps)?,
+            attn,
+            post_attn_norm: self.norm(&n("post_attention_norm"), h, eps)?,
+            ffn_norm: self.norm(&n("ffn_norm"), h, eps)?,
+            mlp: Mlp {
+                gate: self.qmatmul(&n("ffn_gate"), ff, h)?,
+                up: self.qmatmul(&n("ffn_up"), ff, h)?,
+                down: self.qmatmul(&n("ffn_down"), h, ff)?,
+            },
+            post_ffw_norm: self.norm(&n("post_ffw_norm"), h, eps)?,
+            out_scale,
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ModelWeights {
+    embed: Embedding,
+    embed_scale: f64,
+    layers: Vec<Layer>,
+    norm: RmsNorm,
+    lm_head: QMatMul,
+    softcap: Option<f64>,
+    pos: usize,
+    device: Device,
+    cfg: Gemma4Config,
+}
+
+impl ModelWeights {
+    pub fn from_gguf<R: Read + Seek>(ct: gguf_file::Content, reader: &mut R, device: &Device) -> Result<Self> {
+        check_supported(&ct)?;
+        let cfg = Gemma4Config::from_metadata(&ct.metadata)?;
+        let mut ld = Loader { ct: &ct, reader, device };
+        let (h, eps) = (cfg.embedding_length, cfg.rms_norm_eps);
+        let max_pos = cfg.context_length.min(MAX_POSITIONS);
+        let embed_q = ld.qtensor("token_embd.weight")?;
+        let vocab = embed_q.shape().dims()[0];
+        // Dequantized to f32, as the gated Qwen3.5 port does: ggml's get_rows dequantizes to f32,
+        // and an f16 table would round Q8_0 products the oracle does not round. ~5.6 GB at 31B.
+        let embed = Embedding::new(embed_q.dequantize(device)?, h);
+        let lm_head = if ld.has("output.weight") {
+            ld.qmatmul("output.weight", vocab, h)?
+        } else {
+            QMatMul::from_weights(Arc::new(embed_q))? // tied embeddings
+        };
+        let rope_freqs = ld.qtensor("rope_freqs.weight")?.dequantize(device)?.to_vec1::<f32>()?;
+        let rope_full = Arc::new(Rope::new(cfg.rope_dimension_count, cfg.rope_freq_base, Some(&rope_freqs), max_pos, device)?);
+        let rope_swa = Arc::new(Rope::new(cfg.rope_dimension_count_swa, cfg.rope_freq_base_swa, None, max_pos, device)?);
+        let mut layers = Vec::with_capacity(cfg.block_count);
+        for i in 0..cfg.block_count {
+            let rope = if cfg.is_swa[i] { rope_swa.clone() } else { rope_full.clone() };
+            layers.push(ld.layer(&cfg, i, rope)?);
+        }
+        let norm = ld.norm("output_norm.weight", h, eps)?;
+        Ok(Self {
+            embed,
+            embed_scale: (h as f64).sqrt(),
+            layers,
+            norm,
+            lm_head,
+            softcap: cfg.final_logit_softcapping,
+            pos: 0,
+            device: device.clone(),
+            cfg,
+        })
+    }
+
+    pub fn config(&self) -> &Gemma4Config {
+        &self.cfg
+    }
+
+    /// Positions consumed so far; the only offset `forward` accepts.
+    pub fn position(&self) -> usize {
+        self.pos
+    }
+
+    fn masks(&self, b: usize, l: usize, offset: usize) -> Result<Masks> {
+        if l == 1 {
+            return Ok(Masks { full: None, sliding: None });
+        }
+        let w = self.cfg.sliding_window;
+        let prior = offset.min(w);
+        let t = |m: Vec<f32>, n: usize| Tensor::from_vec(m, (l, n), &self.device)?.expand((b, 1, l, n));
+        Ok(Masks {
+            full: Some(t(mask_values(offset, l, 0, offset + l, None), offset + l)?),
+            sliding: Some(t(mask_values(offset, l, offset - prior, prior + l, Some(w)), prior + l)?),
+        })
+    }
+
+    /// Logits of the last position, `[b, vocab]`, softcapped. After an error the state is
+    /// undefined: call [`ModelWeights::clear_kv_cache`] or restore a snapshot.
+    pub fn forward(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        if offset != self.pos {
+            candle::bail!(
+                "forward at position {offset}, but the model's state ends at {}: a snapshot restored \
+                 without its position, or a skipped forward",
+                self.pos
+            )
+        }
+        let (b, l) = input.dims2()?;
+        let masks = self.masks(b, l, offset)?;
+        let mut h = (self.embed.forward(input)? * self.embed_scale)?;
+        for layer in &mut self.layers {
+            h = layer.forward(&h, offset, &masks)?;
+        }
+        self.pos = offset + l;
+        let h = self.norm.forward(&h.narrow(1, l - 1, 1)?)?;
+        let logits = self.lm_head.forward(&h)?.squeeze(1)?;
+        match self.softcap {
+            None => Ok(logits),
+            Some(c) => (logits / c)?.tanh()? * c,
+        }
+    }
+
+    pub fn clear_kv_cache(&mut self) {
+        for layer in &mut self.layers {
+            layer.attn.clear();
+        }
+        self.pos = 0;
+    }
+
+    /// Every layer's state, in layer order. SHARES storage with the model, and the sliding
+    /// rings are written in place: deep-copy anything you keep.
+    pub fn layer_states(&self) -> Vec<LayerState> {
+        self.layers
+            .iter()
+            .map(|layer| match &layer.attn.kv {
+                KvState::Sliding { k, v, write_pos, offset } => {
+                    LayerState::Sliding { k: k.clone(), v: v.clone(), write_pos: *write_pos, offset: *offset }
+                }
+                KvState::Full(c) => LayerState::Full { k: c.k().cloned(), v: c.v().cloned() },
+            })
+            .collect()
+    }
+
+    /// Install `states` AS GIVEN (pass deep copies to keep the snapshot). Validates everything
+    /// before touching the model, so a rejected state changes nothing.
+    pub fn set_layer_states(&mut self, states: &[LayerState]) -> Result<()> {
+        if states.len() != self.layers.len() {
+            candle::bail!("state has {} layers, model has {}", states.len(), self.layers.len())
+        }
+        let window = self.cfg.sliding_window;
+        let mut pos: Option<usize> = None;
+        for (i, (layer, state)) in self.layers.iter().zip(states).enumerate() {
+            let p = match (&layer.attn.kv, state) {
+                (KvState::Sliding { .. }, LayerState::Sliding { k, v, write_pos, offset }) => {
+                    check_sliding_state(i, k, v, *write_pos, *offset, window)?;
+                    *offset
+                }
+                (KvState::Full(_), LayerState::Full { k, v }) => {
+                    if k.is_some() != v.is_some() {
+                        candle::bail!("layer {i}: full-attention state is half-set")
+                    }
+                    state.position()?
+                }
+                _ => candle::bail!("layer {i}: state kind does not match the model's layer kind"),
+            };
+            match pos {
+                None => pos = Some(p),
+                Some(q) if q != p => candle::bail!("layers disagree on the position: layer {i} is at {p}, earlier layers at {q}"),
+                Some(_) => {}
+            }
+        }
+        for (layer, state) in self.layers.iter_mut().zip(states) {
+            match (&mut layer.attn.kv, state) {
+                (KvState::Sliding { k, v, write_pos, offset }, LayerState::Sliding { k: sk, v: sv, write_pos: sw, offset: so }) => {
+                    (*k, *v, *write_pos, *offset) = (sk.clone(), sv.clone(), *sw, *so);
+                }
+                (KvState::Full(c), LayerState::Full { k, v }) => {
+                    c.reset();
+                    if let (Some(k), Some(v)) = (k, v) {
+                        c.append(k, v)?;
+                    }
+                }
+                _ => unreachable!("kinds were checked above"),
+            }
+        }
+        self.pos = pos.unwrap_or(0);
+        Ok(())
     }
 }
 
@@ -592,6 +1061,15 @@ mod config_tests {
         let e = Gemma4Config::from_metadata(&ct.metadata).unwrap_err().to_string();
         assert!(e.contains("gemma4.rope.freq_base_swa"), "{e}");
     }
+
+    /// The ring code takes positions modulo the window; a zero window must be refused up front.
+    #[test]
+    fn a_zero_sliding_window_is_refused() {
+        let (mut ct, _) = tiny::content(&Tiny::default());
+        ct.metadata.insert("gemma4.attention.sliding_window".into(), gguf_file::Value::U32(0));
+        let e = Gemma4Config::from_metadata(&ct.metadata).unwrap_err().to_string();
+        assert!(e.contains("sliding_window"), "{e}");
+    }
 }
 
 #[cfg(test)]
@@ -668,5 +1146,161 @@ mod ring_tests {
         assert_eq!(values(&ck), vec![0, 1, 2, 3]);
         assert_eq!((write_pos, offset), (0, 4));
         assert_eq!(s.position().unwrap(), 4);
+    }
+}
+
+#[cfg(test)]
+mod model_tests {
+    use super::tiny::{self, Tiny};
+    use super::*;
+    use candle::{Device, Tensor};
+
+    fn model() -> ModelWeights {
+        let (ct, mut c) = tiny::content(&Tiny::default());
+        ModelWeights::from_gguf(ct, &mut c, &Device::Cpu).unwrap()
+    }
+
+    fn ids(n: usize, salt: u32) -> Vec<u32> {
+        (0..n as u32).map(|i| (i * 7 + 3 + salt) % tiny::VOCAB as u32).collect()
+    }
+
+    /// Forward `ids` from `start`, `chunk` tokens at a time; the last logits.
+    fn run(m: &mut ModelWeights, ids: &[u32], start: usize, chunk: usize) -> Tensor {
+        let mut pos = start;
+        let mut last = None;
+        for c in ids.chunks(chunk) {
+            let t = Tensor::new(c, &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+            last = Some(m.forward(&t, pos).unwrap());
+            pos += c.len();
+        }
+        last.unwrap()
+    }
+
+    fn vec(t: &Tensor) -> Vec<f32> {
+        t.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    }
+
+    fn max_diff(a: &Tensor, b: &Tensor) -> f32 {
+        vec(a).iter().zip(vec(b)).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    }
+
+    #[test]
+    fn both_attention_paths_are_loaded() {
+        let m = model();
+        assert!(m.layers[0].attn.v_proj.is_some());
+        assert!(m.layers[1].attn.v_proj.is_none(), "k_eq_v on a sliding layer");
+        assert!(m.layers[2].attn.v_proj.is_none(), "k_eq_v on the full layer");
+        assert!(matches!(m.layers[2].attn.kv, KvState::Full(_)));
+    }
+
+    /// 11 tokens, window 4: the ring wraps twice. Decode (no mask, in-place ring), one-shot
+    /// prefill (sliding mask) and 3-token chunks (ring -> chronological -> mask) must agree.
+    #[test]
+    fn decode_prefill_and_chunked_prefill_agree_across_window_wraps() {
+        let x = ids(11, 0);
+        let one_shot = run(&mut model(), &x, 0, 11);
+        let decode = run(&mut model(), &x, 0, 1);
+        let chunked = run(&mut model(), &x, 0, 3);
+        assert!(max_diff(&one_shot, &decode) < 1e-4, "{}", max_diff(&one_shot, &decode));
+        assert!(max_diff(&one_shot, &chunked) < 1e-4, "{}", max_diff(&one_shot, &chunked));
+        let v = vec(&one_shot);
+        assert!(v.iter().any(|&a| (a - v[0]).abs() > 1e-3), "degenerate logits prove nothing");
+    }
+
+    #[test]
+    fn a_restored_snapshot_continues_bit_identically() {
+        let mut m = model();
+        run(&mut m, &ids(7, 0), 0, 7);
+        let snap: Vec<LayerState> = m.layer_states().iter().map(|s| s.deep_copy().unwrap()).collect();
+        let LayerState::Sliding { k: Some(k), write_pos, offset, .. } = &snap[0] else { panic!() };
+        assert_eq!((k.dim(2).unwrap(), *write_pos, *offset), (tiny::WINDOW, 3, 7), "the ring wrapped");
+        let tail = ids(3, 5);
+        let a = run(&mut m, &tail, 7, 1);
+        let fresh: Vec<LayerState> = snap.iter().map(|s| s.deep_copy().unwrap()).collect();
+        m.set_layer_states(&fresh).unwrap();
+        assert_eq!(m.position(), 7);
+        let b = run(&mut m, &tail, 7, 1);
+        assert_eq!(vec(&a), vec(&b));
+    }
+
+    /// The cache gate's shape: restore + suffix prefill == the same split computed inline.
+    #[test]
+    fn restore_then_prefill_equals_the_same_split_inline() {
+        let (prefix, suffix) = (ids(7, 0), ids(4, 9));
+        let mut inline = model();
+        run(&mut inline, &prefix, 0, 7);
+        let x = run(&mut inline, &suffix, 7, 4);
+
+        let mut m = model();
+        run(&mut m, &prefix, 0, 7);
+        let snap: Vec<LayerState> = m.layer_states().iter().map(|s| s.deep_copy().unwrap()).collect();
+        run(&mut m, &ids(2, 3), 7, 1); // dirty the state
+        m.set_layer_states(&snap).unwrap();
+        let y = run(&mut m, &suffix, 7, 4);
+        assert_eq!(vec(&x), vec(&y));
+    }
+
+    #[test]
+    fn a_state_without_its_ring_position_is_refused_and_leaves_the_model_alone() {
+        let mut m = model();
+        run(&mut m, &ids(7, 0), 0, 7);
+        let mut bad: Vec<LayerState> = m.layer_states().iter().map(|s| s.deep_copy().unwrap()).collect();
+        if let LayerState::Sliding { write_pos, .. } = &mut bad[1] {
+            *write_pos = (*write_pos + 1) % tiny::WINDOW;
+        }
+        let e = m.set_layer_states(&bad).unwrap_err().to_string();
+        assert!(e.contains("inconsistent"), "{e}");
+        assert_eq!(m.position(), 7);
+    }
+
+    #[test]
+    fn layers_that_disagree_on_the_position_are_refused() {
+        let mut m = model();
+        run(&mut m, &ids(7, 0), 0, 7);
+        let mut bad: Vec<LayerState> = m.layer_states().iter().map(|s| s.deep_copy().unwrap()).collect();
+        if let LayerState::Full { k, v } = &mut bad[2] {
+            *k = Some(k.as_ref().unwrap().narrow(2, 0, 6).unwrap());
+            *v = Some(v.as_ref().unwrap().narrow(2, 0, 6).unwrap());
+        }
+        assert!(m.set_layer_states(&bad).unwrap_err().to_string().contains("disagree"));
+    }
+
+    #[test]
+    fn a_state_kind_mismatch_is_refused() {
+        let mut m = model();
+        run(&mut m, &ids(3, 0), 0, 3);
+        let mut bad = m.layer_states();
+        bad.swap(0, 2);
+        assert!(m.set_layer_states(&bad).unwrap_err().to_string().contains("kind"));
+    }
+
+    #[test]
+    fn a_forward_at_the_wrong_position_is_refused() {
+        let mut m = model();
+        let t = Tensor::new(&[1u32], &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+        assert!(m.forward(&t, 3).unwrap_err().to_string().contains("position"));
+    }
+
+    #[test]
+    fn positions_beyond_the_rope_table_are_an_error_not_a_panic() {
+        let mut m = model();
+        run(&mut m, &ids(60, 0), 0, 60);
+        let t = Tensor::new(&[1u32, 2, 3, 4, 5], &Device::Cpu).unwrap().unsqueeze(0).unwrap();
+        assert!(m.forward(&t, 60).unwrap_err().to_string().contains("beyond"));
+    }
+
+    #[test]
+    fn softcapped_logits_stay_within_the_cap() {
+        let l = run(&mut model(), &ids(5, 0), 0, 5);
+        assert!(vec(&l).iter().all(|x| x.abs() <= 30.0));
+    }
+
+    #[test]
+    fn clear_kv_cache_resets_the_position() {
+        let mut m = model();
+        run(&mut m, &ids(5, 0), 0, 5);
+        m.clear_kv_cache();
+        assert_eq!(m.position(), 0);
+        assert!(m.layer_states().iter().all(|s| s.position().unwrap() == 0));
     }
 }
