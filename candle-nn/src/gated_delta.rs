@@ -23,9 +23,13 @@
 //! - **Rejected**: writing `state_out` back through a mutated input. That would smuggle an output
 //!   through an argument candle believes is read-only.
 
-use candle::{Layout, Result, Shape, Tensor};
+use candle::{Result, Tensor};
+#[cfg(feature = "metal")]
+use candle::{Layout, Shape};
 
 /// `q, k, v` are the [`candle::CustomOp3`] arguments; these three ride along as fields.
+/// Only exists with `metal`: the CPU path has no kernel, so non-metal builds carry no op state.
+#[cfg(feature = "metal")]
 struct GatedDelta {
     g: Tensor,
     beta: Tensor,
@@ -48,6 +52,7 @@ fn metal_storage_of(t: &Tensor) -> Result<(std::sync::RwLockReadGuard<'_, candle
     Ok((s, l))
 }
 
+#[cfg(feature = "metal")]
 impl candle::CustomOp3 for GatedDelta {
     fn name(&self) -> &'static str {
         "metal-gated-delta"
@@ -67,7 +72,6 @@ impl candle::CustomOp3 for GatedDelta {
         candle::bail!("gated_delta has no cpu impl; use the chunked scan on CPU")
     }
 
-    #[cfg(feature = "metal")]
     fn metal_fwd(
         &self,
         q: &candle::MetalStorage,
@@ -194,6 +198,7 @@ impl candle::CustomOp3 for GatedDelta {
 ///   `state_in`:  `[b, h, dk, dv]`
 ///
 /// Returns `(y [b, t, h, dv], state_out [b, h, dk, dv])`.
+#[cfg(feature = "metal")]
 pub fn gated_delta(
     q: &Tensor,
     k: &Tensor,
@@ -226,4 +231,24 @@ pub fn gated_delta(
         .narrow(0, y_elems, state_elems)?
         .reshape((b, h, dk, dv))?;
     Ok((y, state_out))
+}
+
+/// Without the `metal` feature there is no kernel: every input is a CPU tensor, so this bails.
+#[cfg(not(feature = "metal"))]
+pub fn gated_delta(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    g: &Tensor,
+    beta: &Tensor,
+    state_in: &Tensor,
+) -> Result<(Tensor, Tensor)> {
+    // No CPU arm on purpose. A fallback here would make a pricing round silently measure the
+    // reference implementation twice and report the difference as a speedup.
+    for t in [q, k, v, g, beta, state_in] {
+        if !t.device().is_metal() {
+            candle::bail!("gated_delta has no cpu impl; use the chunked scan on CPU")
+        }
+    }
+    candle::bail!("gated_delta requires candle-nn's `metal` feature")
 }
