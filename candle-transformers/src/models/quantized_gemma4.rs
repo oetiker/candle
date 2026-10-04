@@ -472,6 +472,15 @@ enum KvState {
     Full(ConcatKvCache),
 }
 
+/// K/V of a [`ModelWeights::forward_pending`] call, held until [`ModelWeights::commit`] stores a
+/// prefix of them. Normed, RoPE'd and (for k_eq_v) derived exactly as `store` would receive them.
+#[derive(Debug, Clone)]
+struct Pending {
+    k: Tensor,
+    v: Tensor,
+    offset: usize,
+}
+
 #[derive(Debug, Clone)]
 struct Attention {
     q_proj: QMatMul,
@@ -488,10 +497,12 @@ struct Attention {
     window: usize,
     rope: Arc<Rope>,
     kv: KvState,
+    pending: Option<Pending>,
 }
 
 impl Attention {
-    fn forward(&mut self, x: &Tensor, offset: usize, masks: &Masks, q_block: usize) -> Result<Tensor> {
+    /// Q, K, V for `x` at `offset`, exactly as attention consumes and the cache stores them.
+    fn project(&self, x: &Tensor, offset: usize) -> Result<(Tensor, Tensor, Tensor)> {
         let (b, l, _) = x.dims3()?;
         let (hd, nh, nkv) = (self.head_dim, self.n_heads, self.n_kv_heads);
         let q = self.q_proj.forward(x)?.reshape((b, l, nh, hd))?;
@@ -505,9 +516,91 @@ impl Attention {
         let k = k_raw.reshape((b, l, nkv, hd))?;
         let k = self.rope.apply(&self.k_norm.forward(&k)?.transpose(1, 2)?, offset)?;
         let v = rms_norm_plain(&v_raw.reshape((b, l, nkv, hd))?, self.eps)?.transpose(1, 2)?.contiguous()?;
+        Ok((q, k, v))
+    }
+
+    fn output(&self, q: &Tensor, keys: &Tensor, values: &Tensor, mask: Option<&Tensor>, q_block: usize) -> Result<Tensor> {
+        let (b, _, l, _) = q.dims4()?;
+        let ctx = attend(q, keys, values, mask, self.n_heads / self.n_kv_heads, q_block)?;
+        self.o_proj.forward(&ctx.transpose(1, 2)?.reshape((b, l, self.n_heads * self.head_dim))?)
+    }
+
+    fn forward(&mut self, x: &Tensor, offset: usize, masks: &Masks, q_block: usize) -> Result<Tensor> {
+        let l = x.dim(1)?;
+        let (q, k, v) = self.project(x, offset)?;
         let (keys, values, mask) = self.store(k, v, offset, l, masks)?;
-        let ctx = attend(&q, &keys, &values, mask.as_ref(), nh / nkv, q_block)?;
-        self.o_proj.forward(&ctx.transpose(1, 2)?.reshape((b, l, nh * hd))?)
+        self.output(&q, &keys, &values, mask.as_ref(), q_block)
+    }
+
+    /// [`Attention::forward`] without storing: attends over the cache plus the new K/V and holds
+    /// the new K/V as pending.
+    fn forward_pending(&mut self, x: &Tensor, offset: usize, masks: &Masks, q_block: usize) -> Result<Tensor> {
+        let l = x.dim(1)?;
+        let (q, k, v) = self.project(x, offset)?;
+        let (keys, values, mask) = self.peek(&k, &v, offset, l, masks)?;
+        let out = self.output(&q, &keys, &values, mask.as_ref(), q_block)?;
+        self.pending = Some(Pending { k, v, offset });
+        Ok(out)
+    }
+
+    /// What [`Attention::store`] would return for this forward, touching nothing.
+    fn peek(&self, k: &Tensor, v: &Tensor, offset: usize, l: usize, masks: &Masks) -> Result<(Tensor, Tensor, Option<Tensor>)> {
+        let window = self.window;
+        match &self.kv {
+            KvState::Full(cache) => {
+                let (kc, vc) = match (cache.k(), cache.v()) {
+                    (Some(ck), Some(cv)) => (Tensor::cat(&[ck, k], 2)?, Tensor::cat(&[cv, v], 2)?),
+                    _ => (k.clone(), v.clone()),
+                };
+                Ok((kc, vc, masks.full.clone()))
+            }
+            KvState::Sliding { k: sk, v: sv, write_pos, offset: seen } => {
+                if *seen != offset {
+                    candle::bail!("sliding layer has seen {seen} positions but this forward starts at {offset}")
+                }
+                let (kc, vc) = match (sk, sv) {
+                    (Some(rk), Some(rv)) => (
+                        Tensor::cat(&[&ring_to_chronological(rk, *write_pos, window)?, k], 2)?,
+                        Tensor::cat(&[&ring_to_chronological(rv, *write_pos, window)?, v], 2)?,
+                    ),
+                    (None, None) => (k.clone(), v.clone()),
+                    _ => candle::bail!("sliding state is half-set"),
+                };
+                if kc.dim(2)? != offset.min(window) + l {
+                    candle::bail!("sliding keys {} != min(offset {offset}, window {window}) + {l}", kc.dim(2)?)
+                }
+                Ok((kc, vc, masks.sliding.clone()))
+            }
+        }
+    }
+
+    /// Store the first `m` pending positions, as an `m`-token forward would have. On a full
+    /// sliding ring the positions are written IN PLACE at slot `(offset + i) % window` -- the
+    /// layout `chronological_to_ring` produces -- so no ring is copied (spec §5.1).
+    fn commit(&mut self, m: usize) -> Result<()> {
+        let Some(p) = self.pending.take() else { candle::bail!("commit with nothing pending") };
+        let k = p.k.narrow(2, 0, m)?.contiguous()?;
+        let v = p.v.narrow(2, 0, m)?.contiguous()?;
+        let window = self.window;
+        if let KvState::Sliding { k: Some(rk), v: Some(rv), write_pos, offset: seen } = &mut self.kv {
+            if rk.dim(2)? == window && m <= window {
+                if *seen != p.offset {
+                    candle::bail!("sliding layer has seen {seen} positions but the pending forward started at {}", p.offset)
+                }
+                let first = m.min(window - *write_pos);
+                rk.slice_set(&k.narrow(2, 0, first)?.contiguous()?, 2, *write_pos)?;
+                rv.slice_set(&v.narrow(2, 0, first)?.contiguous()?, 2, *write_pos)?;
+                if first < m {
+                    rk.slice_set(&k.narrow(2, first, m - first)?.contiguous()?, 2, 0)?;
+                    rv.slice_set(&v.narrow(2, first, m - first)?.contiguous()?, 2, 0)?;
+                }
+                *write_pos = (*write_pos + m) % window;
+                *seen += m;
+                return Ok(());
+            }
+        }
+        let none = Masks { full: None, sliding: None };
+        self.store(k, v, p.offset, m, &none).map(|_| ())
     }
 
     /// Store this forward's K/V; return what the queries attend over and the mask for it.
@@ -562,6 +655,7 @@ impl Attention {
     }
 
     fn clear(&mut self) {
+        self.pending = None;
         match &mut self.kv {
             KvState::Full(c) => c.reset(),
             KvState::Sliding { k, v, write_pos, offset } => {
@@ -599,7 +693,17 @@ struct Layer {
 
 impl Layer {
     fn forward(&mut self, x: &Tensor, offset: usize, masks: &Masks, q_block: usize) -> Result<Tensor> {
-        let a = self.attn.forward(&self.attn_norm.forward(x)?, offset, masks, q_block)?;
+        self.run(x, offset, masks, q_block, false)
+    }
+
+    /// The layer body; `pending` routes attention through [`Attention::forward_pending`].
+    fn run(&mut self, x: &Tensor, offset: usize, masks: &Masks, q_block: usize, pending: bool) -> Result<Tensor> {
+        let n = self.attn_norm.forward(x)?;
+        let a = if pending {
+            self.attn.forward_pending(&n, offset, masks, q_block)?
+        } else {
+            self.attn.forward(&n, offset, masks, q_block)?
+        };
         let h = (self.post_attn_norm.forward(&a)? + x)?;
         let f = self.mlp.forward(&self.ffn_norm.forward(&h)?)?;
         let out = (self.post_ffw_norm.forward(&f)? + &h)?;
@@ -668,6 +772,7 @@ impl<R: Read + Seek> Loader<'_, R> {
             window: cfg.sliding_window,
             rope,
             kv,
+            pending: None,
         };
         let out_scale = if self.has(&n("layer_output_scale")) {
             Some(self.qtensor(&n("layer_output_scale"))?.dequantize(self.device)?)
@@ -699,6 +804,7 @@ pub struct ModelWeights {
     lm_head: QMatMul,
     softcap: Option<f64>,
     pos: usize,
+    pending: Option<usize>,
     device: Device,
     cfg: Gemma4Config,
 }
@@ -737,6 +843,7 @@ impl ModelWeights {
             lm_head,
             softcap: cfg.final_logit_softcapping,
             pos: 0,
+            pending: None,
             device: device.clone(),
             cfg,
         })
@@ -772,6 +879,9 @@ impl ModelWeights {
 
     /// [`ModelWeights::forward`] with attention over blocks of at most `q_block` queries.
     fn forward_blocked(&mut self, input: &Tensor, offset: usize, q_block: usize) -> Result<Tensor> {
+        if let Some(l) = self.pending {
+            candle::bail!("forward while {l} positions are pending: commit or clear them first")
+        }
         if offset != self.pos {
             candle::bail!(
                 "forward at position {offset}, but the model's state ends at {}: a snapshot restored \
@@ -794,17 +904,82 @@ impl ModelWeights {
         }
     }
 
+    /// Logits for EVERY position of a `[1, l]` input (`l >= 2`), `[l, vocab]`, softcapped, from
+    /// attention over the cache plus the input -- and nothing stored: the input's K/V are held
+    /// as pending until [`ModelWeights::commit`]. The position does not move. On error the
+    /// pending set is cleared and the cache is as before the call.
+    pub fn forward_pending(&mut self, input: &Tensor, offset: usize) -> Result<Tensor> {
+        if let Some(l) = self.pending {
+            candle::bail!("forward_pending while {l} positions are pending: commit or clear them first")
+        }
+        if offset != self.pos {
+            candle::bail!("forward_pending at position {offset}, but the model's state ends at {}", self.pos)
+        }
+        let (b, l) = input.dims2()?;
+        if b != 1 || l < 2 {
+            candle::bail!("forward_pending takes one sequence of at least 2 positions, got [{b}, {l}]")
+        }
+        let r = self.pending_rows(input, offset, l);
+        if r.is_err() {
+            self.clear_pending();
+        }
+        r
+    }
+
+    fn pending_rows(&mut self, input: &Tensor, offset: usize, l: usize) -> Result<Tensor> {
+        let masks = self.masks(1, l, offset)?;
+        let mut h = (self.embed.forward(input)? * self.embed_scale)?;
+        for layer in &mut self.layers {
+            h = layer.run(&h, offset, &masks, ATTN_Q_BLOCK, true)?;
+        }
+        self.pending = Some(l);
+        let logits = self.lm_head.forward(&self.norm.forward(&h)?)?.squeeze(0)?;
+        match self.softcap {
+            None => Ok(logits),
+            Some(c) => (logits / c)?.tanh()? * c,
+        }
+    }
+
+    /// Store the first `m` of the pending positions and drop the rest (`1 <= m <= l`). A
+    /// rejected `m` changes nothing. After an error inside the store the state is undefined:
+    /// call [`ModelWeights::clear_kv_cache`] or restore a snapshot.
+    pub fn commit(&mut self, m: usize) -> Result<()> {
+        let Some(l) = self.pending else { candle::bail!("commit({m}) with nothing pending") };
+        if m == 0 || m > l {
+            candle::bail!("commit({m}) of {l} pending positions")
+        }
+        for layer in &mut self.layers {
+            layer.attn.commit(m)?;
+        }
+        self.pending = None;
+        self.pos += m;
+        Ok(())
+    }
+
+    /// Drop pending positions without storing any.
+    pub fn clear_pending(&mut self) {
+        for layer in &mut self.layers {
+            layer.attn.pending = None;
+        }
+        self.pending = None;
+    }
+
     pub fn clear_kv_cache(&mut self) {
         for layer in &mut self.layers {
             layer.attn.clear();
         }
         self.pos = 0;
+        self.pending = None;
     }
 
     /// Every layer's state, in layer order. SHARES storage with the model, and the sliding
     /// rings are written in place: deep-copy anything you keep.
-    pub fn layer_states(&self) -> Vec<LayerState> {
-        self.layers
+    pub fn layer_states(&self) -> Result<Vec<LayerState>> {
+        if let Some(l) = self.pending {
+            candle::bail!("layer_states while {l} positions are pending: commit or clear them first")
+        }
+        Ok(self
+            .layers
             .iter()
             .map(|layer| match &layer.attn.kv {
                 KvState::Sliding { k, v, write_pos, offset } => {
@@ -812,7 +987,7 @@ impl ModelWeights {
                 }
                 KvState::Full(c) => LayerState::Full { k: c.k().cloned(), v: c.v().cloned() },
             })
-            .collect()
+            .collect())
     }
 
     /// Install `states` AS GIVEN (pass deep copies to keep the snapshot). Validates everything
@@ -843,6 +1018,7 @@ impl ModelWeights {
                 Some(_) => {}
             }
         }
+        self.clear_pending();
         for (layer, state) in self.layers.iter_mut().zip(states) {
             match (&mut layer.attn.kv, state) {
                 (KvState::Sliding { k, v, write_pos, offset }, LayerState::Sliding { k: sk, v: sv, write_pos: sw, offset: so }) => {
@@ -1277,7 +1453,7 @@ mod model_tests {
     fn a_restored_snapshot_continues_bit_identically() {
         let mut m = model();
         run(&mut m, &ids(7, 0), 0, 7);
-        let snap: Vec<LayerState> = m.layer_states().iter().map(|s| s.deep_copy().unwrap()).collect();
+        let snap: Vec<LayerState> = m.layer_states().unwrap().iter().map(|s| s.deep_copy().unwrap()).collect();
         let LayerState::Sliding { k: Some(k), write_pos, offset, .. } = &snap[0] else { panic!() };
         assert_eq!((k.dim(2).unwrap(), *write_pos, *offset), (tiny::WINDOW, 3, 7), "the ring wrapped");
         let tail = ids(3, 5);
@@ -1299,7 +1475,7 @@ mod model_tests {
 
         let mut m = model();
         run(&mut m, &prefix, 0, 7);
-        let snap: Vec<LayerState> = m.layer_states().iter().map(|s| s.deep_copy().unwrap()).collect();
+        let snap: Vec<LayerState> = m.layer_states().unwrap().iter().map(|s| s.deep_copy().unwrap()).collect();
         run(&mut m, &ids(2, 3), 7, 1); // dirty the state
         m.set_layer_states(&snap).unwrap();
         let y = run(&mut m, &suffix, 7, 4);
@@ -1310,7 +1486,7 @@ mod model_tests {
     fn a_state_without_its_ring_position_is_refused_and_leaves_the_model_alone() {
         let mut m = model();
         run(&mut m, &ids(7, 0), 0, 7);
-        let mut bad: Vec<LayerState> = m.layer_states().iter().map(|s| s.deep_copy().unwrap()).collect();
+        let mut bad: Vec<LayerState> = m.layer_states().unwrap().iter().map(|s| s.deep_copy().unwrap()).collect();
         if let LayerState::Sliding { write_pos, .. } = &mut bad[1] {
             *write_pos = (*write_pos + 1) % tiny::WINDOW;
         }
@@ -1323,7 +1499,7 @@ mod model_tests {
     fn layers_that_disagree_on_the_position_are_refused() {
         let mut m = model();
         run(&mut m, &ids(7, 0), 0, 7);
-        let mut bad: Vec<LayerState> = m.layer_states().iter().map(|s| s.deep_copy().unwrap()).collect();
+        let mut bad: Vec<LayerState> = m.layer_states().unwrap().iter().map(|s| s.deep_copy().unwrap()).collect();
         if let LayerState::Full { k, v } = &mut bad[2] {
             *k = Some(k.as_ref().unwrap().narrow(2, 0, 6).unwrap());
             *v = Some(v.as_ref().unwrap().narrow(2, 0, 6).unwrap());
@@ -1335,7 +1511,7 @@ mod model_tests {
     fn a_state_kind_mismatch_is_refused() {
         let mut m = model();
         run(&mut m, &ids(3, 0), 0, 3);
-        let mut bad = m.layer_states();
+        let mut bad = m.layer_states().unwrap();
         bad.swap(0, 2);
         assert!(m.set_layer_states(&bad).unwrap_err().to_string().contains("kind"));
     }
@@ -1375,6 +1551,137 @@ mod model_tests {
         run(&mut m, &ids(5, 0), 0, 5);
         m.clear_kv_cache();
         assert_eq!(m.position(), 0);
-        assert!(m.layer_states().iter().all(|s| s.position().unwrap() == 0));
+        assert!(m.layer_states().unwrap().iter().all(|s| s.position().unwrap() == 0));
+    }
+
+    fn t(ids: &[u32]) -> Tensor {
+        Tensor::new(ids, &Device::Cpu).unwrap().unsqueeze(0).unwrap()
+    }
+
+    /// Every layer as (k, v, write_pos, offset); full layers report write_pos 0.
+    fn snapshot(m: &ModelWeights) -> Vec<(Vec<f32>, Vec<f32>, usize, usize)> {
+        let f = |o: &Option<Tensor>| o.as_ref().map(vec).unwrap_or_default();
+        m.layer_states()
+            .unwrap()
+            .iter()
+            .map(|s| match s {
+                LayerState::Sliding { k, v, write_pos, offset } => (f(k), f(v), *write_pos, *offset),
+                LayerState::Full { k, v } => (f(k), f(v), 0, s.position().unwrap()),
+            })
+            .collect()
+    }
+
+    /// Positions exact, tensors within `tol` (K/V from a longer forward are different GEMM shapes).
+    fn assert_states_close(a: &ModelWeights, b: &ModelWeights, tol: f32, what: &str) {
+        for (i, (x, y)) in snapshot(a).iter().zip(snapshot(b)).enumerate() {
+            assert_eq!((x.2, x.3), (y.2, y.3), "{what}: layer {i} position");
+            assert_eq!((x.0.len(), x.1.len()), (y.0.len(), y.1.len()), "{what}: layer {i} shape");
+            let d = x.0.iter().chain(&x.1).zip(y.0.iter().chain(&y.1)).map(|(p, q)| (p - q).abs()).fold(0.0, f32::max);
+            assert!(d < tol, "{what}: layer {i} differs by {d}");
+        }
+    }
+
+    #[test]
+    fn every_pending_row_is_the_logits_of_that_prefix() {
+        let (prefix, block) = (ids(7, 0), ids(4, 9));
+        let mut s = model();
+        run(&mut s, &prefix, 0, 7);
+        let rows = s.forward_pending(&t(&block), 7).unwrap();
+        assert_eq!(rows.dims(), &[4, tiny::VOCAB]);
+        assert_eq!(s.position(), 7, "forward_pending must not move the position");
+        for i in 0..4 {
+            let mut p = model();
+            run(&mut p, &prefix, 0, 7);
+            let want = run(&mut p, &block[..=i], 7, 1);
+            let got = rows.narrow(0, i, 1).unwrap();
+            assert!(max_diff(&want, &got) < 1e-4, "row {i}: {}", max_diff(&want, &got));
+        }
+    }
+
+    /// Prefix 2: the ring fills during the commit (store path). Prefix 7: the ring is full and
+    /// wrapped, write_pos 3, so a 3-position commit splits 1 + 2 around the wrap (in-place path).
+    #[test]
+    fn pending_then_commit_all_is_bit_identical_to_forward() {
+        for prefix_len in [2usize, 7] {
+            let (prefix, block) = (ids(prefix_len, 0), ids(3, 9));
+            let mut a = model();
+            run(&mut a, &prefix, 0, prefix_len);
+            let la = a.forward(&t(&block), prefix_len).unwrap();
+            let mut b = model();
+            run(&mut b, &prefix, 0, prefix_len);
+            let rows = b.forward_pending(&t(&block), prefix_len).unwrap();
+            b.commit(3).unwrap();
+            assert_eq!(b.position(), prefix_len + 3);
+            assert_eq!(snapshot(&a), snapshot(&b), "prefix {prefix_len}: state must be bit-identical");
+            let last = rows.narrow(0, 2, 1).unwrap();
+            assert!(max_diff(&la, &last) < 1e-5, "prefix {prefix_len}: last row {}", max_diff(&la, &last));
+        }
+    }
+
+    #[test]
+    fn a_partial_commit_continues_like_a_plain_run() {
+        let (prefix, block, tail) = (ids(7, 0), ids(4, 9), ids(3, 5));
+        for m in 1..=4 {
+            let mut p = model();
+            run(&mut p, &prefix, 0, 7);
+            run(&mut p, &block[..m], 7, 1);
+            let plain = run(&mut p, &tail, 7 + m, 1);
+            let mut s = model();
+            run(&mut s, &prefix, 0, 7);
+            s.forward_pending(&t(&block), 7).unwrap();
+            s.commit(m).unwrap();
+            let spec = run(&mut s, &tail, 7 + m, 1);
+            assert!(max_diff(&plain, &spec) < 1e-4, "m {m}: {}", max_diff(&plain, &spec));
+        }
+    }
+
+    #[test]
+    fn rejected_positions_leave_no_trace_in_the_ring() {
+        for prefix_len in [2usize, 7] {
+            let (prefix, block) = (ids(prefix_len, 0), ids(4, 9));
+            let mut s = model();
+            run(&mut s, &prefix, 0, prefix_len);
+            s.forward_pending(&t(&block), prefix_len).unwrap();
+            s.commit(2).unwrap();
+            let mut p = model();
+            run(&mut p, &prefix, 0, prefix_len);
+            p.forward(&t(&block[..2]), prefix_len).unwrap();
+            assert_states_close(&s, &p, 1e-5, &format!("prefix {prefix_len}"));
+            // check_sliding_state runs inside set_layer_states: a round trip proves the ring is consistent.
+            let st: Vec<LayerState> = s.layer_states().unwrap().iter().map(|x| x.deep_copy().unwrap()).collect();
+            s.set_layer_states(&st).unwrap();
+            assert_eq!(s.position(), prefix_len + 2);
+        }
+    }
+
+    #[test]
+    fn pending_invariants_are_hard_errors() {
+        let mut m = model();
+        run(&mut m, &ids(5, 0), 0, 5);
+        assert!(m.commit(1).is_err(), "nothing pending");
+        assert!(m.forward_pending(&t(&ids(1, 3)), 5).is_err(), "a single position is a plain forward");
+        assert!(m.forward_pending(&t(&ids(2, 3)), 4).is_err(), "wrong offset");
+        m.forward_pending(&t(&ids(3, 3)), 5).unwrap();
+        assert!(m.forward(&t(&ids(1, 3)), 5).is_err(), "forward while pending");
+        assert!(m.forward_pending(&t(&ids(2, 3)), 5).is_err(), "forward_pending while pending");
+        assert!(m.layer_states().is_err(), "capture while pending");
+        assert!(m.commit(0).is_err());
+        assert!(m.commit(4).is_err());
+        m.commit(3).unwrap();
+        assert_eq!(m.position(), 8, "a rejected commit changed nothing");
+    }
+
+    #[test]
+    fn restore_and_clear_drop_pending_positions() {
+        let mut m = model();
+        run(&mut m, &ids(7, 0), 0, 7);
+        let snap: Vec<LayerState> = m.layer_states().unwrap().iter().map(|s| s.deep_copy().unwrap()).collect();
+        m.forward_pending(&t(&ids(3, 3)), 7).unwrap();
+        let fresh: Vec<LayerState> = snap.iter().map(|s| s.deep_copy().unwrap()).collect();
+        m.set_layer_states(&fresh).unwrap();
+        m.forward(&t(&ids(1, 3)), 7).unwrap();
+        m.forward_pending(&t(&ids(3, 3)), 8).unwrap();
+        m.clear_kv_cache();
+        m.forward(&t(&ids(2, 3)), 0).unwrap();
     }
 }
