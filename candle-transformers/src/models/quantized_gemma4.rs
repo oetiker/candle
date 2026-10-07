@@ -20,7 +20,6 @@
 
 use super::with_tracing::QMatMul;
 use crate::quantized_nn::RmsNorm;
-use crate::utils::repeat_kv;
 use candle::quantized::{gguf_file, QTensor};
 use candle::{DType, Device, Module, Result, Tensor, D};
 use candle_nn::kv_cache::ConcatKvCache;
@@ -431,14 +430,22 @@ pub(crate) const ATTN_Q_BLOCK: usize = 512;
 /// Scale 1.0: Gemma 4 relies on q_norm/k_norm (gemma4.cpp `f_attention_scale = 1.0f`).
 /// `mask` is `[b, 1, L, keys]` (a broadcast view); softmax is per query row, so attending
 /// `q_block` query rows at a time equals the unblocked result.
+///
+/// GQA without repeating K/V: query head `h` reads KV head `h / n_rep` (repeat_kv's layout), so
+/// the `n_rep` heads of one KV head are stacked as `n_rep * len` query rows against that head's
+/// K/V. Materialising the repeat copied every layer's whole K/V `n_rep` times per forward -- at
+/// 5k context ~1.4 GB per full layer, plus a fresh pool allocation each decode step.
 fn attend(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>, n_rep: usize, q_block: usize) -> Result<Tensor> {
     if q_block == 0 {
         candle::bail!("attention query block must be at least 1")
     }
-    let k = repeat_kv(k.clone(), n_rep)?.contiguous()?;
-    let v = repeat_kv(v.clone(), n_rep)?.contiguous()?;
-    let kt = k.t()?;
-    let l = q.dim(2)?;
+    let (b, n_heads, l, hd) = q.dims4()?;
+    let (n_kv, keys) = (k.dim(1)?, k.dim(2)?);
+    if n_heads != n_kv * n_rep {
+        candle::bail!("{n_heads} query heads != {n_kv} kv heads x n_rep {n_rep}")
+    }
+    let kt = k.contiguous()?.t()?;
+    let v = v.contiguous()?;
     let mut blocks = Vec::with_capacity(l.div_ceil(q_block));
     let mut start = 0;
     while start < l {
@@ -448,11 +455,15 @@ fn attend(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>, n_rep: usiz
             rest if rest == q_block + 1 => rest,
             rest => rest.min(q_block),
         };
-        let mut scores = q.narrow(2, start, len)?.contiguous()?.matmul(&kt)?;
+        let rows = n_rep * len;
+        let qb = q.narrow(2, start, len)?.contiguous()?.reshape((b, n_kv, rows, hd))?;
+        let mut scores = qb.matmul(&kt)?;
         if let Some(m) = mask {
-            scores = scores.broadcast_add(&m.narrow(2, start, len)?)?;
+            let m = m.narrow(2, start, len)?.unsqueeze(2)?;
+            scores = scores.reshape((b, n_kv, n_rep, len, keys))?.broadcast_add(&m)?.reshape((b, n_kv, rows, keys))?;
         }
-        blocks.push(candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?);
+        let ctx = candle_nn::ops::softmax_last_dim(&scores)?.matmul(&v)?;
+        blocks.push(ctx.reshape((b, n_heads, len, hd))?);
         start += len;
     }
     match blocks.len() {
@@ -1277,6 +1288,69 @@ mod config_tests {
         ct.metadata.insert("gemma4.attention.sliding_window".into(), gguf_file::Value::U32(0));
         let e = Gemma4Config::from_metadata(&ct.metadata).unwrap_err().to_string();
         assert!(e.contains("sliding_window"), "{e}");
+    }
+}
+
+#[cfg(test)]
+mod attend_tests {
+    use super::*;
+    use candle::{Device, Tensor};
+
+    /// The textbook GQA attention `attend` must match: every KV head materialised `n_rep` times.
+    fn reference(q: &Tensor, k: &Tensor, v: &Tensor, mask: Option<&Tensor>, n_rep: usize) -> Tensor {
+        let k = crate::utils::repeat_kv(k.clone(), n_rep).unwrap().contiguous().unwrap();
+        let v = crate::utils::repeat_kv(v.clone(), n_rep).unwrap().contiguous().unwrap();
+        let mut s = q.contiguous().unwrap().matmul(&k.t().unwrap()).unwrap();
+        if let Some(m) = mask {
+            s = s.broadcast_add(m).unwrap();
+        }
+        candle_nn::ops::softmax_last_dim(&s).unwrap().matmul(&v).unwrap()
+    }
+
+    /// Deterministic values in [-1, 1).
+    fn rand(shape: (usize, usize, usize, usize), seed: u64) -> Tensor {
+        let n = shape.0 * shape.1 * shape.2 * shape.3;
+        let mut x = seed;
+        let v: Vec<f32> = (0..n)
+            .map(|_| {
+                x = x.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                ((x >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+            })
+            .collect();
+        Tensor::from_vec(v, shape, &Device::Cpu).unwrap()
+    }
+
+    fn max_diff(a: &Tensor, b: &Tensor) -> f32 {
+        let a = a.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        let b = b.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+        assert_eq!(a.len(), b.len());
+        a.iter().zip(b).map(|(x, y)| (x - y).abs()).fold(0.0, f32::max)
+    }
+
+    /// `attend` equals the repeat_kv reference: decode (l = 1, no mask), multi-row with a causal
+    /// mask, and query blocks that leave a lone trailing row, for n_rep 1, 2 and 8 (Gemma 4 31B:
+    /// 2 on sliding layers, 8 on full ones).
+    #[test]
+    fn attention_matches_the_repeat_kv_reference() {
+        let (b, n_kv, hd, keys) = (1, 2, 8, 13);
+        for n_rep in [1, 2, 8] {
+            for (l, q_block) in [(1, 512), (5, 512), (7, 3), (7, 2)] {
+                let q = rand((b, n_kv * n_rep, l, hd), 1 + n_rep as u64 * 10 + l as u64);
+                let k = rand((b, n_kv, keys, hd), 2 + n_rep as u64);
+                let v = rand((b, n_kv, keys, hd), 3 + n_rep as u64);
+                let mask = (l > 1).then(|| {
+                    Tensor::from_vec(mask_values(keys - l, l, 0, keys, None), (l, keys), &Device::Cpu)
+                        .unwrap()
+                        .expand((b, 1, l, keys))
+                        .unwrap()
+                });
+                let got = attend(&q, &k, &v, mask.as_ref(), n_rep, q_block).unwrap();
+                let want = reference(&q, &k, &v, mask.as_ref(), n_rep);
+                assert_eq!(got.dims(), want.dims());
+                let d = max_diff(&got, &want);
+                assert!(d < 1e-5, "n_rep {n_rep} l {l} q_block {q_block}: max diff {d}");
+            }
+        }
     }
 }
 
